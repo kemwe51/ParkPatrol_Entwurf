@@ -6,7 +6,7 @@
 // - Always fetch same-origin assets with cache: 'no-store' (network-first).
 // - Provide a tiny offline fallback for navigation if network is down.
 
-const OFFLINE_CACHE = "parkpatrol-offline-v1";
+const OFFLINE_CACHE = "parkpatrol-offline-v2";
 const OFFLINE_URL = "./offline.html";
 
 self.addEventListener("install", (event) => {

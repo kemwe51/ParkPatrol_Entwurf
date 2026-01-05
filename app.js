@@ -72,7 +72,7 @@ const state = {
 };
 
 // --------- Schema expectations (from 001_init.sql) ----------
-// public.orgs(id, name, created_at, owner_id)
+// public.organizations(id, name, created_at, owner_id)
 // public.org_members(org_id, user_id, role, created_at)
 // public.properties(id, org_id, name, street, zip, city, created_at)
 // public.permits(id, org_id, property_id, plate, visitor_name, valid_from, valid_to, note, created_at)
@@ -190,7 +190,7 @@ async function loadOrgContext() {
   // Load orgs user belongs to
   const { data: memberships, error } = await supabase
     .from("org_members")
-    .select("role, org:orgs(id,name,created_at)")
+    .select("role, org:organizations(id,name,created_at)")
     .order("created_at", { ascending: true });
 
   if (error) {
@@ -347,7 +347,7 @@ function renderOnboarding() {
 
     // Create org (owner_id is current user)
     const { data: org, error: e1 } = await supabase
-      .from("orgs")
+      .from("organizations")
       .insert({ name })
       .select("*")
       .single();
