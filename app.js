@@ -855,6 +855,11 @@ function renderReportCreate(propsList) {
         <div class="label">Foto</div>
         <input class="input" id="rPhoto" type="file" accept="image/*" capture="environment"/>
 
+        <div class="row" style="margin-top:10px">
+          <button class="btn" id="btnOcr">OCR aus Foto</button>
+          <div class="chip" id="ocrState">OCR: –</div>
+        </div>
+
         <div style="display:flex;gap:10px;margin-top:14px;flex-wrap:wrap">
           <button class="btn primary" id="btnSaveReport">Speichern</button>
           <button class="btn" id="btnCancel">Abbrechen</button>
@@ -876,6 +881,36 @@ function renderReportCreate(propsList) {
   wireNavbar();
 
   const geo = { lat:null, lng:null };
+  let ocrRunToken = 0;
+  const setOcrState = (t) => { const el = $("#ocrState"); if (el) el.textContent = t; };
+  const runOcrForSelectedPhoto = async () => {
+    const file = $("#rPhoto")?.files?.[0];
+    if (!file) return toast("Bitte zuerst ein Foto wählen.", "err");
+
+    const token = ++ocrRunToken;
+    setOcrState("OCR: läuft …");
+
+    try {
+      const plate = await ocrPlateFromImageFile(file, (p) => {
+        if (token !== ocrRunToken) return;
+        if (typeof p === "number") setOcrState(`OCR: ${Math.round(p * 100)}%`);
+      });
+      if (token !== ocrRunToken) return;
+      if (!plate) {
+        setOcrState("OCR: kein Treffer");
+        toast("Kein Kennzeichen erkannt. Tipp: näher ran / bessere Beleuchtung.", "err");
+        return;
+      }
+      $("#rPlate").value = plate;
+      setOcrState("OCR: erkannt ✓");
+      toast("Kennzeichen erkannt: " + plate, "ok");
+    } catch (e) {
+      if (token !== ocrRunToken) return;
+      console.warn(e);
+      setOcrState("OCR: Fehler");
+      toast("OCR fehlgeschlagen: " + (e?.message || e), "err");
+    }
+  };
 
   $("#btnCancel").addEventListener("click", () => location.hash = "#/reports");
 
@@ -904,7 +939,16 @@ function renderReportCreate(propsList) {
     $("#previewImg").src = url;
     $("#previewImg").style.display = "block";
     $("#previewText").style.display = "none";
+    setOcrState("OCR: bereit");
+    // Auto-OCR: starte nach kurzer Idle-Phase (schneller Workflow).
+    if ("requestIdleCallback" in window) {
+      window.requestIdleCallback(() => { void runOcrForSelectedPhoto(); }, { timeout: 1200 });
+    } else {
+      setTimeout(() => { void runOcrForSelectedPhoto(); }, 350);
+    }
   });
+
+  $("#btnOcr").addEventListener("click", () => { void runOcrForSelectedPhoto(); });
 
   $("#btnSaveReport").addEventListener("click", async () => {
     const plate = $("#rPlate").value.trim().replace(/\s+/g,"").toUpperCase() || null;
@@ -946,6 +990,150 @@ function renderReportCreate(propsList) {
     toast("Bericht gespeichert.", "ok");
     location.hash = "#/reports";
   });
+}
+
+// --------- OCR (Client-side, no backend required) ----------
+// Uses Tesseract.js via CDN, loaded lazily only when OCR is triggered.
+// Goal: extract Swiss license plates (e.g., ZH123456) from a photo.
+
+const _CH_CANTONS = new Set([
+  "AG","AI","AR","BE","BL","BS","FR","GE","GL","GR","JU","LU","NE","NW","OW","SG","SH","SO","SZ","TG","TI","UR","VD","VS","ZG","ZH","FL"
+]);
+
+function _extractPlateFromText(text) {
+  const s = String(text || "")
+    .toUpperCase()
+    .replace(/[^A-Z0-9\s]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  // Swiss-style: 2 letters + 1..6 digits
+  const candidates = [];
+  for (const m of s.matchAll(/(?:^|\s)([A-Z]{2})\s*([0-9]{1,6})(?=\s|$)/g)) {
+    const code = m[1];
+    const digits = m[2];
+    if (!_CH_CANTONS.has(code)) continue;
+    const plate = `${code}${digits}`;
+    // Prefer typical lengths (4-6 digits), but keep all
+    const score = (digits.length >= 4 ? 1 : 0.6) + (digits.length >= 5 ? 0.2 : 0);
+    candidates.push({ plate, score });
+  }
+
+  // Fallback: any A..Z + digits (useful for EU plates), keep conservative
+  if (!candidates.length) {
+    for (const m of s.matchAll(/(?:^|\s)([A-Z]{1,3})([0-9]{1,4})([A-Z]{1,3})(?=\s|$)/g)) {
+      const plate = `${m[1]}${m[2]}${m[3]}`;
+      if (plate.length < 5) continue;
+      candidates.push({ plate, score: 0.4 });
+    }
+  }
+
+  candidates.sort((a, b) => b.score - a.score);
+  return candidates[0]?.plate || null;
+}
+
+async function _fileToCanvas(file, maxEdge = 1600) {
+  const img = await fileToImage(file);
+  const ratio = Math.min(maxEdge / img.width, maxEdge / img.height, 1);
+  const w = Math.max(1, Math.round(img.width * ratio));
+  const h = Math.max(1, Math.round(img.height * ratio));
+  const c = document.createElement("canvas");
+  c.width = w; c.height = h;
+  const ctx = c.getContext("2d");
+  ctx.drawImage(img, 0, 0, w, h);
+  return c;
+}
+
+function _cropCanvas(src, x, y, w, h) {
+  const c = document.createElement("canvas");
+  c.width = Math.max(1, Math.round(w));
+  c.height = Math.max(1, Math.round(h));
+  const ctx = c.getContext("2d");
+  ctx.drawImage(src, Math.round(x), Math.round(y), Math.round(w), Math.round(h), 0, 0, c.width, c.height);
+  return c;
+}
+
+function _enhanceForOcr(canvas) {
+  const ctx = canvas.getContext("2d");
+  const img = ctx.getImageData(0, 0, canvas.width, canvas.height);
+  const d = img.data;
+  // light grayscale + contrast bump
+  const contrast = 1.25;
+  const intercept = 128 * (1 - contrast);
+  for (let i = 0; i < d.length; i += 4) {
+    const r = d[i], g = d[i + 1], b = d[i + 2];
+    let v = 0.299 * r + 0.587 * g + 0.114 * b;
+    v = contrast * v + intercept;
+    v = v < 0 ? 0 : v > 255 ? 255 : v;
+    d[i] = d[i + 1] = d[i + 2] = v;
+    // keep alpha
+  }
+  ctx.putImageData(img, 0, 0);
+  return canvas;
+}
+
+function _buildOcrCandidates(baseCanvas) {
+  const w = baseCanvas.width;
+  const h = baseCanvas.height;
+  const crops = [];
+  crops.push(baseCanvas);
+  // Bottom region (plates often in lower part)
+  crops.push(_cropCanvas(baseCanvas, w * 0.08, h * 0.55, w * 0.84, h * 0.40));
+  // Center region
+  crops.push(_cropCanvas(baseCanvas, w * 0.12, h * 0.35, w * 0.76, h * 0.45));
+  // Make them OCR-friendly
+  return crops.map((c) => _enhanceForOcr(c));
+}
+
+async function ocrPlateFromImageFile(file, onProgress) {
+  // Lazy-load Tesseract only when needed.
+  const mod = await import("https://cdn.jsdelivr.net/npm/tesseract.js@4.1.1/dist/tesseract.esm.min.js");
+  const createWorker = mod.createWorker || mod.default?.createWorker;
+  if (!createWorker) throw new Error("Tesseract konnte nicht geladen werden.");
+
+  const baseCanvas = await _fileToCanvas(file, 1700);
+  const canvases = _buildOcrCandidates(baseCanvas);
+
+  const worker = await createWorker({
+    logger: (m) => {
+      if (m?.status === "recognizing text" && typeof m.progress === "number") onProgress?.(m.progress);
+    }
+  });
+
+  try {
+    if (worker.load) await worker.load();
+    if (worker.loadLanguage) await worker.loadLanguage("eng");
+    if (worker.initialize) await worker.initialize("eng");
+    if (worker.setParameters) {
+      await worker.setParameters({
+        tessedit_char_whitelist: "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789",
+        preserve_interword_spaces: "1"
+      });
+    }
+
+    let bestPlate = null;
+    let bestConf = -1;
+
+    for (const c of canvases) {
+      const res = await worker.recognize(c);
+      const text = res?.data?.text ?? "";
+      const plate = _extractPlateFromText(text);
+      const conf = typeof res?.data?.confidence === "number" ? res.data.confidence : 0;
+      if (plate) {
+        // Prefer higher confidence (0..100)
+        if (conf > bestConf) {
+          bestConf = conf;
+          bestPlate = plate;
+        }
+        // Early-exit if confidence looks good
+        if (conf >= 70) break;
+      }
+    }
+
+    return bestPlate;
+  } finally {
+    try { await worker.terminate(); } catch {}
+  }
 }
 
 function safeName(name) {
