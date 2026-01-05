@@ -1,2 +1,3 @@
 #!/usr/bin/env bash
-npx serve . -l 5173
+cd "$(dirname "$0")"
+python3 -m http.server 5173

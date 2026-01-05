@@ -1,1088 +1,991 @@
 // web/app.js
-import { SUPABASE_URL, SUPABASE_ANON_KEY } from "./config.js";
+import { SUPABASE_URL, SUPABASE_ANON_KEY, APP_NAME } from "./config.js";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 
-const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+// Supabase client (persist session across reloads)
+const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
+  auth: { persistSession: true, autoRefreshToken: true, detectSessionInUrl: true }
+});
 
-// DOM helpers
+// ---------- PWA (no hard refresh needed) ----------
+async function registerServiceWorker() {
+  if (!("serviceWorker" in navigator)) return;
+
+  try {
+    const reg = await navigator.serviceWorker.register("./sw.js", { scope: "./" });
+
+    // Proactively check for updates on load
+    reg.update().catch(() => {});
+
+    // If a new SW is waiting, activate it immediately
+    if (reg.waiting) {
+      reg.waiting.postMessage({ type: "SKIP_WAITING" });
+    }
+
+    reg.addEventListener("updatefound", () => {
+      const nw = reg.installing;
+      if (!nw) return;
+      nw.addEventListener("statechange", () => {
+        if (nw.state === "installed" && navigator.serviceWorker.controller) {
+          showToast("Update verfügbar – App wird aktualisiert…");
+          nw.postMessage({ type: "SKIP_WAITING" });
+        }
+      });
+    });
+
+    // Reload once the new SW takes control (seamless update)
+    navigator.serviceWorker.addEventListener("controllerchange", () => {
+      // Avoid infinite reloads
+      if (registerServiceWorker._reloaded) return;
+      registerServiceWorker._reloaded = true;
+      window.location.reload();
+    });
+
+  } catch (e) {
+    // SW optional; app still works without it
+    console.warn("SW registration failed:", e);
+  }
+}
+registerServiceWorker();
+
+// ---------- Tiny UI helpers ----------
 const $ = (sel) => document.querySelector(sel);
-const el = (tag, props={}, children=[]) => {
+const el = (tag, props = {}, children = []) => {
   const n = document.createElement(tag);
-  Object.entries(props).forEach(([k,v])=>{
+  for (const [k, v] of Object.entries(props)) {
     if (k === "class") n.className = v;
     else if (k === "html") n.innerHTML = v;
     else if (k.startsWith("on") && typeof v === "function") n.addEventListener(k.slice(2), v);
     else n.setAttribute(k, v);
-  });
-  (Array.isArray(children) ? children : [children]).filter(Boolean).forEach(c=>{
-    if (typeof c === "string") n.appendChild(document.createTextNode(c));
-    else n.appendChild(c);
-  });
+  }
+  for (const c of children) n.append(c);
   return n;
 };
 
-const app = $("#app");
-const bottomNav = $("#bottomNav");
-const btnInstall = $("#btnInstall");
-const btnSignOut = $("#btnSignOut");
+const appRoot = $("#app");
 const toast = $("#toast");
-
-function showToast(msg, ms=2200){
+function showToast(msg, ms = 2300) {
   toast.textContent = msg;
   toast.hidden = false;
   clearTimeout(showToast._t);
-  showToast._t = setTimeout(()=> toast.hidden = true, ms);
+  showToast._t = setTimeout(() => (toast.hidden = true), ms);
 }
 
-let deferredPrompt = null;
-window.addEventListener("beforeinstallprompt", (e) => {
-  e.preventDefault();
-  deferredPrompt = e;
-  btnInstall.hidden = false;
-});
-btnInstall?.addEventListener("click", async () => {
-  if (!deferredPrompt) return showToast("Installation nicht verfügbar.");
-  deferredPrompt.prompt();
-  await deferredPrompt.userChoice;
-  deferredPrompt = null;
-  btnInstall.hidden = true;
-});
-
-// ====== State ======
-let session = null;
-let profile = null;
-let orgs = [];
-let activeOrg = null;
-
-function setActiveNav(route){
-  bottomNav.querySelectorAll(".nav-item").forEach(b=>{
-    b.classList.toggle("active", b.dataset.route === route);
-  });
+function icon(name) {
+  // Minimal inline icon set
+  const map = {
+    home: `<svg viewBox="0 0 24 24" fill="none"><path d="M4 10.5L12 4l8 6.5V20a1 1 0 0 1-1 1h-5v-6H10v6H5a1 1 0 0 1-1-1v-9.5Z" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/></svg>`,
+    prop: `<svg viewBox="0 0 24 24" fill="none"><path d="M4 20V9l8-5 8 5v11" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/><path d="M9 20v-7h6v7" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/></svg>`,
+    permit: `<svg viewBox="0 0 24 24" fill="none"><path d="M7 7h10v14H7z" stroke="currentColor" stroke-width="1.8"/><path d="M9 3h6v4H9z" stroke="currentColor" stroke-width="1.8"/><path d="M9 11h6M9 14h6" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>`,
+    report: `<svg viewBox="0 0 24 24" fill="none"><path d="M7 3h7l3 3v15H7z" stroke="currentColor" stroke-width="1.8"/><path d="M9 10h6M9 13h6M9 16h5" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>`,
+    gear: `<svg viewBox="0 0 24 24" fill="none"><path d="M12 15.5a3.5 3.5 0 1 0 0-7 3.5 3.5 0 0 0 0 7Z" stroke="currentColor" stroke-width="1.8"/><path d="M19.4 15a8 8 0 0 0 .1-2l2-1.2-2-3.5-2.2.7a7.7 7.7 0 0 0-1.7-1L15 5h-4l-.6 2a7.7 7.7 0 0 0-1.7 1L6.5 7.3l-2 3.5 2 1.2a8 8 0 0 0 .1 2l-2 1.2 2 3.5 2.2-.7c.5.4 1.1.7 1.7 1l.6 2h4l.6-2c.6-.3 1.2-.6 1.7-1l2.2.7 2-3.5-2-1.2Z" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round"/></svg>`,
+    plus: `<svg viewBox="0 0 24 24" fill="none"><path d="M12 5v14M5 12h14" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"/></svg>`,
+    chevron: `<svg viewBox="0 0 24 24" fill="none"><path d="m9 18 6-6-6-6" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"/></svg>`,
+  };
+  return map[name] || "";
 }
 
-bottomNav?.addEventListener("click", (e) => {
-  const btn = e.target.closest(".nav-item");
-  if (!btn) return;
-  location.hash = btn.dataset.route;
-});
-
-// ====== Router ======
-const routes = new Map();
-function route(path, handler){ routes.set(path, handler); }
-
-async function navigate(){
-  const hash = location.hash || "#/login";
-  const path = hash.split("?")[0];
-
-  // highlight nav
-  if (path.startsWith("#/home") || path.startsWith("#/reports") || path.startsWith("#/visitors") || path.startsWith("#/settings")){
-    setActiveNav(path);
+function fmtDateTime(s) {
+  if (!s) return "";
+  try {
+    return new Intl.DateTimeFormat("de-CH", { dateStyle: "medium", timeStyle: "short" }).format(new Date(s));
+  } catch {
+    return s;
   }
-
-  const handler = routes.get(path) || routes.get("#/404");
-  await handler?.();
+}
+function fmtDate(s) {
+  if (!s) return "";
+  try {
+    return new Intl.DateTimeFormat("de-CH", { dateStyle: "medium" }).format(new Date(s));
+  } catch {
+    return s;
+  }
 }
 
-window.addEventListener("hashchange", navigate);
+// ---------- App state ----------
+const state = {
+  session: null,
+  profile: null,
+  orgs: [],
+  activeOrgId: null,
+};
 
-// ====== Auth + bootstrap ======
-async function loadSession(){
-  const { data } = await supabase.auth.getSession();
-  session = data?.session || null;
+// ---------- Data layer ----------
+async function getProfile() {
+  const { data, error } = await supabase.from("profiles").select("*").eq("id", state.session.user.id).maybeSingle();
+  if (error) throw error;
+  return data;
 }
 
-async function loadProfile(){
-  if (!session?.user?.id) { profile = null; return; }
-  const { data, error } = await supabase.from("profiles").select("*").eq("id", session.user.id).single();
-  if (error) { console.warn(error); profile = null; return; }
-  profile = data;
+async function getOrgs() {
+  const { data, error } = await supabase
+    .from("org_members")
+    .select("org_id, role, organizations:org_id(id,name)")
+    .order("created_at", { ascending: true });
+  if (error) throw error;
+  const orgs = (data || [])
+    .map((r) => ({ id: r.organizations?.id, name: r.organizations?.name, role: r.role }))
+    .filter((o) => o.id);
+  return orgs;
 }
 
-async function loadOrgs(){
-  if (!session?.user?.id) { orgs = []; activeOrg = null; return; }
-  // organizations visible via RLS
-  const { data, error } = await supabase.from("organizations").select("id,name,is_active,created_at").order("created_at",{ascending:false});
-  if (error) { console.warn(error); orgs = []; activeOrg = null; return; }
-  orgs = data || [];
-  // remember last org
-  const last = localStorage.getItem("pp.activeOrg");
-  activeOrg = orgs.find(o=>o.id === last) || orgs[0] || null;
-  if (activeOrg) localStorage.setItem("pp.activeOrg", activeOrg.id);
+async function ensureActiveOrg() {
+  if (!state.orgs.length) {
+    state.activeOrgId = null;
+    return;
+  }
+  const stored = localStorage.getItem("pp_active_org");
+  const found = stored && state.orgs.find((o) => o.id === stored);
+  state.activeOrgId = found ? found.id : state.orgs[0].id;
+  localStorage.setItem("pp_active_org", state.activeOrgId);
 }
 
-function requireAuth(){
-  if (!session) { location.hash = "#/login"; return false; }
-  return true;
+async function loadContext() {
+  if (!state.session) return;
+  state.profile = await getProfile().catch(() => null);
+  state.orgs = await getOrgs().catch(() => []);
+  await ensureActiveOrg();
 }
 
-function requireOrg(){
-  if (!activeOrg){
-    location.hash = "#/onboarding";
+function requireAuth() {
+  if (!state.session) {
+    location.hash = "#/login";
     return false;
   }
   return true;
 }
 
-btnSignOut?.addEventListener("click", async ()=>{
-  await supabase.auth.signOut();
-  session = null;
-  profile = null;
-  orgs = [];
-  activeOrg = null;
-  bottomNav.hidden = true;
-  btnSignOut.hidden = true;
-  location.hash = "#/login";
-});
-
-supabase.auth.onAuthStateChange(async (_event, newSession)=>{
-  session = newSession;
-  if (session){
-    await bootstrap();
-    // go home unless user is in onboarding
-    if (!location.hash || location.hash.startsWith("#/login") || location.hash.startsWith("#/register")){
-      location.hash = "#/home";
-    }
-  }else{
-    bottomNav.hidden = true;
-    btnSignOut.hidden = true;
-    if (!location.hash || !location.hash.startsWith("#/login")) location.hash = "#/login";
-  }
-});
-
-async function bootstrap(){
-  await loadSession();
-  if (!session) return;
-  await Promise.all([loadProfile(), loadOrgs()]);
-  bottomNav.hidden = false;
-  btnSignOut.hidden = false;
+// ---------- Router ----------
+const routesPublic = new Set(["#/login", "#/register"]);
+function route() {
+  const h = location.hash || "#/";
+  return h;
 }
 
-// ====== Views ======
-function viewAuthCard(title, subtitle, contentEl){
-  const card = el("section", { class:"card" }, [
-    el("div",{class:"section"},[
-      el("div",{class:"h1"}, title),
-      el("div",{class:"muted"}, subtitle),
-      el("hr",{class:"sep"}),
-      contentEl
+window.addEventListener("hashchange", render);
+
+async function bootAuth() {
+  // 1) Restore existing session (no reload hacks)
+  const { data: { session } } = await supabase.auth.getSession();
+  state.session = session;
+
+  // 2) Keep in sync
+  supabase.auth.onAuthStateChange(async (_event, session) => {
+    state.session = session;
+    await loadContext().catch(() => {});
+    // Reroute cleanly
+    const h = route();
+    if (!session && !routesPublic.has(h)) location.hash = "#/login";
+    if (session && routesPublic.has(h)) location.hash = "#/";
+    render();
+  });
+
+  if (state.session) await loadContext().catch(() => {});
+}
+
+async function start() {
+  await bootAuth();
+
+  // Default route
+  if (!location.hash) location.hash = "#/";
+  render();
+}
+start();
+
+// ---------- Layout ----------
+function Topbar() {
+  const orgName = state.activeOrgId ? (state.orgs.find(o => o.id === state.activeOrgId)?.name || "Organisation") : "Keine Organisation";
+  const orgLine = state.session ? orgName : "Anmelden";
+
+  const left = el("div", { class: "brand" }, [
+    el("div", { class: "logo", html: `<span style="font-weight:900">P</span>` }),
+    el("div", { class: "t" }, [
+      el("div", { class: "name", html: APP_NAME || "ParkPatrol" }),
+      el("div", { class: "org", html: orgLine })
     ])
   ]);
-  return card;
+
+  const right = state.session
+    ? el("button", { class: "pill", onClick: () => openOrgSheet() }, [
+        el("span", { html: "Mandat" }),
+        el("small", { html: state.orgs.length ? `${state.orgs.length}` : "0" }),
+        el("span", { html: icon("chevron") })
+      ])
+    : el("div");
+
+  return el("div", { class: "topbar" }, [
+    el("div", { class: "container row", style: "justify-content:space-between" }, [
+      left, right
+    ])
+  ]);
 }
 
-route("#/login", async ()=>{
-  bottomNav.hidden = true;
-  btnSignOut.hidden = true;
-  app.innerHTML = "";
-  const email = el("input",{class:"input",placeholder:"E‑mail",type:"email",autocomplete:"email"});
-  const pass = el("input",{class:"input",placeholder:"Passwort",type:"password",autocomplete:"current-password"});
-  const btn = el("button",{class:"btn",type:"button"}, "Einloggen");
-  const reg = el("button",{class:"btn secondary",type:"button", onclick:()=>location.hash="#/register"}, "Registrieren");
+function BottomNav(active) {
+  if (!state.session) return el("div");
+  const items = [
+    ["#/","Übersicht","home"],
+    ["#/properties","Liegenschaften","prop"],
+    ["#/permits","Besucher","permit"],
+    ["#/reports","Verstösse","report"],
+    ["#/settings","Settings","gear"],
+  ];
 
-  btn.addEventListener("click", async ()=>{
-    const e = email.value.trim();
-    const p = pass.value;
-    if (!e || !p) return showToast("Bitte E‑mail & Passwort eingeben.");
-    const { error } = await supabase.auth.signInWithPassword({ email:e, password:p });
-    if (error) return showToast("Login fehlgeschlagen: " + error.message);
-    showToast("Eingeloggt.");
-  });
-
-  const content = el("div",{class:"col"}, [email, pass, btn, reg, el("div",{class:"small"}, "Tipp: Für Produktion bitte Email‑Verifikation aktivieren.")]);
-  app.appendChild(viewAuthCard("Los geht's", "Mandanten-Konsole · ParkPatrol", content));
-});
-
-route("#/register", async ()=>{
-  bottomNav.hidden = true;
-  btnSignOut.hidden = true;
-  app.innerHTML = "";
-  const first = el("input",{class:"input",placeholder:"Vorname"});
-  const last = el("input",{class:"input",placeholder:"Nachname"});
-  const email = el("input",{class:"input",placeholder:"E‑mail",type:"email",autocomplete:"email"});
-  const pass = el("input",{class:"input",placeholder:"Passwort (min. 8)",type:"password",autocomplete:"new-password"});
-  const btn = el("button",{class:"btn",type:"button"}, "Account erstellen");
-  const back = el("button",{class:"btn ghost",type:"button", onclick:()=>location.hash="#/login"}, "Zurück");
-
-  btn.addEventListener("click", async ()=>{
-    const e = email.value.trim();
-    const p = pass.value;
-    if (!e || !p) return showToast("Bitte E‑mail & Passwort eingeben.");
-    const { data, error } = await supabase.auth.signUp({
-      email: e,
-      password: p,
-      options: { data: { first_name:first.value.trim(), last_name:last.value.trim() } }
-    });
-    if (error) return showToast("Registrierung fehlgeschlagen: " + error.message);
-    showToast("Account erstellt. Bitte Email bestätigen (falls aktiviert).");
-    // Update profile best-effort
-    if (data?.user?.id){
-      await supabase.from("profiles").update({ first_name:first.value.trim()||null, last_name:last.value.trim()||null }).eq("id", data.user.id);
-    }
-    location.hash = "#/home";
-  });
-
-  const content = el("div",{class:"col"}, [first,last,email,pass,btn,back]);
-  app.appendChild(viewAuthCard("Registrieren", "Mandant selbst anlegen · danach Organisation erstellen", content));
-});
-
-// Onboarding: create org + first property
-route("#/onboarding", async ()=>{
-  if (!requireAuth()) return;
-  bottomNav.hidden = true;
-  app.innerHTML = "";
-
-  const orgName = el("input",{class:"input",placeholder:"Name des Mandanten / Firma (z.B. Hausverwaltung Müller)"});
-  const propName = el("input",{class:"input",placeholder:"Name der Liegenschaft (z.B. Erligasse 1)"});
-  const street = el("input",{class:"input",placeholder:"Strasse"});
-  const plz = el("input",{class:"input",placeholder:"PLZ"});
-  const city = el("input",{class:"input",placeholder:"Stadt"});
-  const btn = el("button",{class:"btn",type:"button"}, "Erstellen");
-  const skip = el("button",{class:"btn secondary",type:"button"}, "Nur Organisation erstellen");
-
-  async function createOrg(withProperty){
-    const name = orgName.value.trim();
-    if (!name) return showToast("Bitte Organisationsname angeben.");
-    const { data:org, error } = await supabase.from("organizations").insert({ name, created_by: session.user.id }).select("*").single();
-    if (error) return showToast("Org erstellen fehlgeschlagen: " + error.message);
-
-    activeOrg = org;
-    localStorage.setItem("pp.activeOrg", org.id);
-
-    if (withProperty){
-      const pn = propName.value.trim();
-      if (pn){
-        const { error:pe } = await supabase.from("properties").insert({
-          org_id: org.id,
-          created_by: session.user.id,
-          name: pn,
-          street: street.value.trim() || null,
-          postal_code: plz.value.trim() || null,
-          city: city.value.trim() || null,
-          country: "CH"
-        });
-        if (pe) showToast("Liegenschaft konnte nicht gespeichert werden: " + pe.message, 3200);
-      }
-    }
-
-    await loadOrgs();
-    bottomNav.hidden = false;
-    location.hash = "#/home";
-  }
-
-  btn.addEventListener("click", ()=>createOrg(true));
-  skip.addEventListener("click", ()=>createOrg(false));
-
-  const content = el("div",{class:"col"}, [
-    el("div",{class:"pill warn"},"Noch keine Organisation – Onboarding"),
-    orgName,
-    el("hr",{class:"sep"}),
-    el("div",{class:"muted"},"Optional: erste Liegenschaft anlegen"),
-    propName, street,
-    el("div",{class:"row"}, [plz, city]),
-    el("div",{class:"row"}, [btn, skip]),
-  ]);
-
-  app.appendChild(viewAuthCard("Onboarding", "Erstelle deine Mandanten-Organisation", content));
-});
-
-// Home dashboard
-route("#/home", async ()=>{
-  if (!requireAuth()) return;
-  await loadOrgs();
-  if (!requireOrg()) return;
-
-  bottomNav.hidden = false;
-  app.innerHTML = "";
-
-  const orgSelect = el("select",{class:"select"});
-  (orgs||[]).forEach(o=>{
-    orgSelect.appendChild(el("option",{value:o.id}, o.name));
-  });
-  if (activeOrg) orgSelect.value = activeOrg.id;
-
-  orgSelect.addEventListener("change", async ()=>{
-    const id = orgSelect.value;
-    activeOrg = orgs.find(o=>o.id===id) || null;
-    if (activeOrg) localStorage.setItem("pp.activeOrg", activeOrg.id);
-    showToast("Organisation gewechselt.");
-    await navigate();
-  });
-
-  const quick = el("div",{class:"grid"},[
-    el("div",{class:"card"}, el("div",{class:"section"},[
-      el("div",{class:"h1"},"Bericht erstellen"),
-      el("div",{class:"muted"},"Foto, Zeit, Ort, Kennzeichen – in Sekunden."),
-      el("div",{style:"height:10px"}),
-      el("button",{class:"btn",type:"button",onclick:()=>location.hash="#/reports?new=1"},"Starten")
-    ])),
-    el("div",{class:"card"}, el("div",{class:"section"},[
-      el("div",{class:"h1"},"Besucher bewilligen"),
-      el("div",{class:"muted"},"Temporäre Nummernschilder freischalten."),
-      el("div",{style:"height:10px"}),
-      el("button",{class:"btn secondary",type:"button",onclick:()=>location.hash="#/visitors?new=1"},"Neu")
-    ])),
-    el("div",{class:"card"}, el("div",{class:"section"},[
-      el("div",{class:"h1"},"Liegenschaften"),
-      el("div",{class:"muted"},"Objekte & Parkbereiche verwalten."),
-      el("div",{style:"height:10px"}),
-      el("button",{class:"btn ghost",type:"button",onclick:()=>openPropertyManager()},"Öffnen")
-    ])),
-  ]);
-
-  const header = el("section",{class:"card"}, el("div",{class:"section"},[
-    el("div",{class:"row"},[
-      el("div",{style:"flex:1"},[
-        el("div",{class:"h1"},"Willkommen"),
-        el("div",{class:"muted"}, (profile?.first_name ? `${profile.first_name} ${profile.last_name||""}`.trim() : (session.user.email || "")))
-      ]),
-      orgSelect
-    ]),
-    el("div",{class:"small"},"Tipp: In Einstellungen kannst du dein Profil vervollständigen & Team-Mitglieder einladen.")
-  ]));
-
-  app.appendChild(header);
-  app.appendChild(quick);
-});
-
-// Reports
-route("#/reports", async ()=>{
-  if (!requireAuth()) return;
-  await loadOrgs();
-  if (!requireOrg()) return;
-  bottomNav.hidden = false;
-
-  const params = new URLSearchParams((location.hash.split("?")[1]||""));
-  const createNew = params.get("new") === "1";
-
-  app.innerHTML = "";
-  const head = el("section",{class:"card"}, el("div",{class:"section"},[
-    el("div",{class:"h1"},"Parkverstossberichte"),
-    el("div",{class:"muted"},"Erstellen, prüfen, archivieren (ohne Abschleppdienst)."),
-  ]));
-
-  const listWrap = el("section",{class:"card"}, el("div",{class:"section"},[
-    el("div",{class:"row"},[
-      el("button",{class:"btn",type:"button",onclick:()=>openReportEditor()},"Neuer Bericht"),
-      el("button",{class:"btn secondary",type:"button",onclick:()=>loadReports()},"Neu laden"),
-    ]),
-    el("div",{style:"height:10px"}),
-    el("div",{class:"list", id:"reportList"}, "Lade…")
-  ]));
-
-  app.appendChild(head);
-  app.appendChild(listWrap);
-
-  async function loadReports(){
-    const list = $("#reportList");
-    list.textContent = "Lade…";
-    const { data, error } = await supabase
-      .from("reports")
-      .select("id,created_at,status,plate,address_text,occurred_at,property_id,area_id,meta")
-      .eq("org_id", activeOrg.id)
-      .order("created_at",{ascending:false})
-      .limit(100);
-    if (error) return (list.textContent = "Fehler: "+error.message);
-
-    if (!data?.length){
-      list.innerHTML = "";
-      list.appendChild(el("div",{class:"muted"}, "Noch keine Berichte."));
-      return;
-    }
-
-    list.innerHTML = "";
-    for (const r of data){
-      const item = el("div",{class:"item"},[
-        el("div",{class:"item-top"},[
-          el("div",{},[
-            el("div",{class:"item-title"}, r.plate || "—"),
-            el("div",{class:"item-sub"}, r.address_text || "—")
-          ]),
-          el("div",{class:"pill"}, labelStatus(r.status))
-        ]),
-        el("div",{class:"small"}, new Date(r.created_at).toLocaleString()),
-        el("div",{class:"row"},[
-          el("button",{class:"btn ghost",type:"button",onclick:()=>openReportEditor(r.id)},"Öffnen"),
-          el("button",{class:"btn danger",type:"button",onclick:()=>deleteReport(r.id)},"Löschen")
-        ])
-      ]);
-      list.appendChild(item);
-    }
-  }
-
-  function labelStatus(s){
-    const map = { draft:"Entwurf", submitted:"Eingereicht", reviewed:"Geprüft", closed:"Abgeschlossen" };
-    return map[s] || s;
-  }
-
-  async function deleteReport(id){
-    if (!confirm("Bericht wirklich löschen? (Fotos werden nicht automatisch aus Storage entfernt)")) return;
-    const { error } = await supabase.from("reports").delete().eq("id", id).eq("org_id", activeOrg.id);
-    if (error) return showToast("Löschen fehlgeschlagen: " + error.message);
-    showToast("Gelöscht.");
-    loadReports();
-  }
-
-  async function openReportEditor(reportId=null){
-    app.innerHTML = "";
-    const isEdit = !!reportId;
-    const title = isEdit ? "Bericht bearbeiten" : "Neuer Bericht";
-
-    // Load properties/areas
-    const { data:propsData } = await supabase.from("properties").select("id,name,street,postal_code,city").eq("org_id", activeOrg.id).order("created_at",{ascending:false});
-    const properties = propsData || [];
-    if (!properties.length){
-      app.appendChild(el("section",{class:"card"}, el("div",{class:"section"},[
-        el("div",{class:"h1"},"Keine Liegenschaft gefunden"),
-        el("div",{class:"muted"},"Bitte zuerst mindestens eine Liegenschaft anlegen."),
-        el("div",{style:"height:10px"}),
-        el("button",{class:"btn",onclick:()=>openPropertyManager()},"Liegenschaft anlegen")
-      ])));
-      return;
-    }
-
-    let record = null;
-    if (isEdit){
-      const { data, error } = await supabase.from("reports").select("*").eq("id", reportId).single();
-      if (error) return showToast("Konnte Bericht nicht laden: "+error.message);
-      record = data;
-    }
-
-    const propertySel = el("select",{class:"select"});
-    properties.forEach(p=> propertySel.appendChild(el("option",{value:p.id}, p.name)));
-    propertySel.value = record?.property_id || properties[0].id;
-
-    const areaSel = el("select",{class:"select"});
-    async function loadAreas(){
-      areaSel.innerHTML = "";
-      areaSel.appendChild(el("option",{value:""}, "— (kein Bereich)"));
-      const { data } = await supabase.from("parking_areas").select("id,name").eq("org_id", activeOrg.id).eq("property_id", propertySel.value).order("created_at",{ascending:false});
-      (data||[]).forEach(a=> areaSel.appendChild(el("option",{value:a.id}, a.name)));
-      areaSel.value = record?.area_id || "";
-    }
-    propertySel.addEventListener("change", loadAreas);
-    await loadAreas();
-
-    const plate = el("input",{class:"input",placeholder:"Kennzeichen (z.B. AG 12345)"});
-    plate.value = record?.plate || "";
-
-    const addr = el("input",{class:"input",placeholder:"Adresse (optional; wird via Geolocation ergänzt)"});
-    addr.value = record?.address_text || "";
-
-    const occurredAt = el("input",{class:"input",type:"datetime-local"});
-    occurredAt.value = record?.occurred_at ? toLocalInput(new Date(record.occurred_at)) : toLocalInput(new Date());
-
-    const notes = el("textarea",{class:"textarea",placeholder:"Notizen (z.B. blockiert Einfahrt, markierter Platz, etc.)"});
-    notes.value = record?.meta?.notes || "";
-
-    const photoImg = el("img",{class:"photo",alt:"Beweisfoto", hidden:true});
-    const photoMeta = el("div",{class:"small", id:"photoMeta"}, "");
-    const btnPhoto = el("button",{class:"btn secondary",type:"button"},"Foto aufnehmen / wählen");
-
-    btnPhoto.addEventListener("click", async ()=>{
-      const f = await pickImage();
-      if (!f) return;
-      const { blob, previewUrl } = await normalizeImage(f);
-      photoImg.src = previewUrl;
-      photoImg.hidden = false;
-      photoMeta.textContent = `${Math.round(blob.size/1024)} KB`;
-      btnPhoto._blob = blob;
-    });
-
-    const btnGeo = el("button",{class:"btn ghost",type:"button"},"Position erfassen");
-    btnGeo.addEventListener("click", async ()=>{
-      const pos = await getGeo();
-      if (!pos) return;
-      btnGeo._pos = pos;
-      showToast("Position gespeichert.");
-      // optional: reverse geocode hook
-      // const addrText = await reverseGeocode(pos.lat, pos.lng);
-      // if (addrText && !addr.value) addr.value = addrText;
-    });
-
-    const btnSave = el("button",{class:"btn",type:"button"}, isEdit ? "Speichern" : "Erstellen");
-    const btnBack = el("button",{class:"btn ghost",type:"button",onclick:()=>location.hash="#/reports"}, "Zurück");
-
-    btnSave.addEventListener("click", async ()=>{
-      const payload = {
-        org_id: activeOrg.id,
-        property_id: propertySel.value,
-        area_id: areaSel.value || null,
-        plate: plate.value.trim() || null,
-        address_text: addr.value.trim() || null,
-        occurred_at: fromLocalInput(occurredAt.value) || new Date().toISOString(),
-        meta: { notes: notes.value.trim() || null }
-      };
-
-      const pos = btnGeo._pos;
-      if (pos){
-        payload.lat = pos.lat;
-        payload.lng = pos.lng;
-      }
-
-      let saved = null;
-      if (isEdit){
-        const { data, error } = await supabase.from("reports").update(payload).eq("id", reportId).select("*").single();
-        if (error) return showToast("Speichern fehlgeschlagen: " + error.message);
-        saved = data;
-      }else{
-        payload.created_by = session.user.id;
-        const { data, error } = await supabase.from("reports").insert(payload).select("*").single();
-        if (error) return showToast("Erstellen fehlgeschlagen: " + error.message);
-        saved = data;
-      }
-
-      // Photo upload if present
-      if (btnPhoto._blob && saved?.id){
-        const path = `org/${activeOrg.id}/reports/${saved.id}/${Date.now()}.jpg`;
-        const { error:upErr } = await supabase.storage.from("captures").upload(path, btnPhoto._blob, { contentType:"image/jpeg", upsert:true });
-        if (upErr){
-          showToast("Foto Upload fehlgeschlagen: " + upErr.message, 3200);
-        }else{
-          await supabase.from("report_photos").insert({
-            report_id: saved.id,
-            org_id: activeOrg.id,
-            storage_path: path,
-            mime_type:"image/jpeg",
-            bytes: btnPhoto._blob.size
-          });
-        }
-      }
-
-      showToast("Gespeichert.");
-      location.hash = "#/reports";
-    });
-
-    const card = el("section",{class:"card"}, el("div",{class:"section"},[
-      el("div",{class:"h1"}, title),
-      el("div",{class:"muted"},"Beweisfoto + Metadaten. Optional OCR/Adresse/Geo."),
-      el("hr",{class:"sep"}),
-      el("div",{class:"col"},[
-        el("div",{class:"row"},[propertySel, areaSel]),
-        plate,
-        addr,
-        occurredAt,
-        notes,
-        btnPhoto,
-        photoImg,
-        photoMeta,
-        el("div",{class:"row"},[btnGeo]),
-        el("div",{class:"row"},[btnSave, btnBack]),
+  const inner = el("div", { class: "inner" });
+  for (const [href, label, ico] of items) {
+    inner.append(
+      el("button", {
+        class: "navbtn" + (active === href ? " active" : ""),
+        onClick: () => (location.hash = href)
+      }, [
+        el("div", { html: icon(ico) }),
+        el("div", { html: label })
       ])
-    ]));
-
-    app.appendChild(card);
+    );
   }
+  return el("div", { class: "bottomnav" }, [inner]);
+}
 
-  async function pickImage(){
-    // Use native file input
-    const input = document.getElementById("fileInput");
-    return new Promise((resolve)=>{
-      input.value = "";
-      input.onchange = () => resolve(input.files?.[0] || null);
-      input.click();
-    });
-  }
+function PageShell(active, contentNode) {
+  appRoot.innerHTML = "";
+  appRoot.append(Topbar());
+  appRoot.append(el("div", { class: "main" }, [el("div", { class: "container" }, [contentNode])]));
+  appRoot.append(BottomNav(active));
+}
 
-  async function normalizeImage(file){
-    // Resize to max 1600px and strip metadata (canvas re-encode)
-    const img = await fileToImage(file);
-    const max = 1600;
-    let { width, height } = img;
-    const scale = Math.min(1, max / Math.max(width, height));
-    width = Math.round(width * scale);
-    height = Math.round(height * scale);
+function CenterCard(title, bodyNode) {
+  return el("div", { class: "card", style: "max-width:520px;margin:36px auto" }, [
+    el("div", { class: "hd" }, [
+      el("h2", { html: title }),
+      el("span", { class: "badge", html: "PWA" })
+    ]),
+    el("div", { class: "bd" }, [bodyNode])
+  ]);
+}
 
-    const canvas = document.getElementById("workCanvas");
-    canvas.width = width;
-    canvas.height = height;
-    const ctx = canvas.getContext("2d");
-    ctx.drawImage(img, 0, 0, width, height);
+// ---------- Org sheet (switcher) ----------
+let orgSheetEl = null;
+function openOrgSheet() {
+  if (!orgSheetEl) orgSheetEl = OrgSheet();
+  orgSheetEl.classList.add("open");
+}
+function closeOrgSheet() {
+  orgSheetEl?.classList.remove("open");
+}
+function OrgSheet() {
+  const modal = el("div", { class: "modal", onClick: (e) => { if (e.target === modal) closeOrgSheet(); } });
+  const sheet = el("div", { class: "sheet" });
 
-    const blob = await new Promise(res => canvas.toBlob(res, "image/jpeg", 0.85));
-    const previewUrl = URL.createObjectURL(blob);
-    return { blob, previewUrl };
-  }
-
-  function fileToImage(file){
-    return new Promise((resolve, reject)=>{
-      const url = URL.createObjectURL(file);
-      const img = new Image();
-      img.onload = ()=> { URL.revokeObjectURL(url); resolve(img); };
-      img.onerror = reject;
-      img.src = url;
-    });
-  }
-
-  function toLocalInput(d){
-    const pad=(n)=>String(n).padStart(2,"0");
-    return `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
-  }
-  function fromLocalInput(v){
-    if (!v) return null;
-    try{ return new Date(v).toISOString(); }catch(_e){ return null; }
-  }
-
-  async function getGeo(){
-    if (!("geolocation" in navigator)) { showToast("Geolocation nicht verfügbar."); return null; }
-    return new Promise((resolve)=>{
-      navigator.geolocation.getCurrentPosition(
-        (p)=> resolve({ lat:p.coords.latitude, lng:p.coords.longitude, acc:p.coords.accuracy }),
-        ()=> { showToast("Position konnte nicht erfasst werden."); resolve(null); },
-        { enableHighAccuracy:true, timeout: 8000 }
+  const list = el("div", { class: "list" });
+  const refresh = () => {
+    list.innerHTML = "";
+    for (const o of state.orgs) {
+      const active = o.id === state.activeOrgId;
+      list.append(
+        el("div", { class: "item", style: active ? "border-color:rgba(110,145,255,.45);background:rgba(110,145,255,.10)" : "" }, [
+          el("div", {}, [
+            el("div", { class: "title", html: o.name }),
+            el("div", { class: "sub", html: `Rolle: ${o.role}` })
+          ]),
+          el("button", { class: "btn", onClick: () => {
+            state.activeOrgId = o.id;
+            localStorage.setItem("pp_active_org", o.id);
+            closeOrgSheet();
+            render();
+          } }, [el("span", { html: active ? "Aktiv" : "Wechseln" })])
+        ])
       );
-    });
-  }
-
-  await loadReports();
-  if (createNew) openReportEditor();
-});
-
-// Visitors (permits)
-route("#/visitors", async ()=>{
-  if (!requireAuth()) return;
-  await loadOrgs();
-  if (!requireOrg()) return;
-  bottomNav.hidden = false;
-
-  const params = new URLSearchParams((location.hash.split("?")[1]||""));
-  const createNew = params.get("new") === "1";
-
-  app.innerHTML = "";
-  const head = el("section",{class:"card"}, el("div",{class:"section"},[
-    el("div",{class:"h1"},"Besucher & Kennzeichen"),
-    el("div",{class:"muted"},"Bewilligungen verwalten und prüfen."),
-  ]));
-
-  const body = el("section",{class:"card"}, el("div",{class:"section"},[
-    el("div",{class:"row"},[
-      el("button",{class:"btn",onclick:()=>openPermitEditor()},"Neue Bewilligung"),
-      el("button",{class:"btn secondary",onclick:()=>loadPermits()},"Neu laden")
-    ]),
-    el("div",{style:"height:10px"}),
-    el("div",{class:"list", id:"permitList"}, "Lade…")
-  ]));
-
-  app.appendChild(head);
-  app.appendChild(body);
-
-  async function loadPermits(){
-    const list = $("#permitList");
-    list.textContent = "Lade…";
-    const { data, error } = await supabase
-      .from("visitor_permits")
-      .select("id,created_at,plate,visitor_name,valid_from,valid_to,notes,property_id,area_id")
-      .eq("org_id", activeOrg.id)
-      .order("created_at",{ascending:false})
-      .limit(200);
-
-    if (error) return (list.textContent = "Fehler: " + error.message);
-    if (!data?.length){
-      list.innerHTML = "";
-      list.appendChild(el("div",{class:"muted"},"Noch keine Bewilligungen."));
-      return;
     }
-
-    list.innerHTML = "";
-    for (const p of data){
-      const vf = p.valid_from ? new Date(p.valid_from).toLocaleString() : "—";
-      const vt = p.valid_to ? new Date(p.valid_to).toLocaleString() : "—";
-      const active = isNowInRange(p.valid_from, p.valid_to);
-
-      list.appendChild(el("div",{class:"item"},[
-        el("div",{class:"item-top"},[
-          el("div",{},[
-            el("div",{class:"item-title"}, p.plate || "—"),
-            el("div",{class:"item-sub"}, p.visitor_name || "Besucher")
-          ]),
-          el("div",{class:"pill " + (active ? "ok":"warn")}, active ? "Aktiv" : "Inaktiv")
-        ]),
-        el("div",{class:"small"}, `${vf} → ${vt}`),
-        p.notes ? el("div",{class:"small"}, p.notes) : null,
-        el("div",{class:"row"},[
-          el("button",{class:"btn ghost",onclick:()=>openPermitEditor(p.id)},"Bearbeiten"),
-          el("button",{class:"btn danger",onclick:()=>deletePermit(p.id)},"Löschen"),
-        ])
-      ]));
+    if (!state.orgs.length) {
+      list.append(el("div", { class: "muted small", html: "Noch kein Mandat. Erstelle eines im Onboarding." }));
     }
-  }
+  };
 
-  function isNowInRange(from, to){
-    const now = Date.now();
-    const f = from ? new Date(from).getTime() : -Infinity;
-    const t = to ? new Date(to).getTime() : Infinity;
-    return now >= f && now <= t;
-  }
-
-  async function deletePermit(id){
-    if (!confirm("Bewilligung löschen?")) return;
-    const { error } = await supabase.from("visitor_permits").delete().eq("id", id).eq("org_id", activeOrg.id);
-    if (error) return showToast("Löschen fehlgeschlagen: " + error.message);
-    showToast("Gelöscht.");
-    loadPermits();
-  }
-
-  async function openPermitEditor(id=null){
-    app.innerHTML = "";
-    const isEdit = !!id;
-
-    const { data:propsData } = await supabase.from("properties").select("id,name").eq("org_id", activeOrg.id).order("created_at",{ascending:false});
-    const properties = propsData || [];
-    if (!properties.length){
-      app.appendChild(el("section",{class:"card"}, el("div",{class:"section"},[
-        el("div",{class:"h1"},"Keine Liegenschaft gefunden"),
-        el("div",{class:"muted"},"Bitte zuerst mindestens eine Liegenschaft anlegen."),
-        el("div",{style:"height:10px"}),
-        el("button",{class:"btn",onclick:()=>openPropertyManager()},"Liegenschaft anlegen")
-      ])));
-      return;
-    }
-
-    let record = null;
-    if (isEdit){
-      const { data, error } = await supabase.from("visitor_permits").select("*").eq("id", id).single();
-      if (error) return showToast("Konnte nicht laden: " + error.message);
-      record = data;
-    }
-
-    const propertySel = el("select",{class:"select"});
-    properties.forEach(p=> propertySel.appendChild(el("option",{value:p.id}, p.name)));
-    propertySel.value = record?.property_id || properties[0].id;
-
-    const areaSel = el("select",{class:"select"});
-    async function loadAreas(){
-      areaSel.innerHTML = "";
-      areaSel.appendChild(el("option",{value:""}, "— (kein Bereich)"));
-      const { data } = await supabase.from("parking_areas").select("id,name").eq("org_id", activeOrg.id).eq("property_id", propertySel.value).order("created_at",{ascending:false});
-      (data||[]).forEach(a=> areaSel.appendChild(el("option",{value:a.id}, a.name)));
-      areaSel.value = record?.area_id || "";
-    }
-    propertySel.addEventListener("change", loadAreas);
-    await loadAreas();
-
-    const plate = el("input",{class:"input",placeholder:"Kennzeichen"});
-    plate.value = record?.plate || "";
-    const name = el("input",{class:"input",placeholder:"Name (optional)"});
-    name.value = record?.visitor_name || "";
-    const from = el("input",{class:"input",type:"datetime-local"});
-    from.value = record?.valid_from ? toLocalInput(new Date(record.valid_from)) : "";
-    const to = el("input",{class:"input",type:"datetime-local"});
-    to.value = record?.valid_to ? toLocalInput(new Date(record.valid_to)) : "";
-    const notes = el("textarea",{class:"textarea",placeholder:"Notizen"});
-    notes.value = record?.notes || "";
-
-    const btnSave = el("button",{class:"btn"}, isEdit ? "Speichern" : "Erstellen");
-    const btnBack = el("button",{class:"btn ghost",onclick:()=>location.hash="#/visitors"}, "Zurück");
-
-    btnSave.addEventListener("click", async ()=>{
-      const payload = {
-        org_id: activeOrg.id,
-        property_id: propertySel.value,
-        area_id: areaSel.value || null,
-        plate: plate.value.trim(),
-        visitor_name: name.value.trim() || null,
-        valid_from: from.value ? new Date(from.value).toISOString() : null,
-        valid_to: to.value ? new Date(to.value).toISOString() : null,
-        notes: notes.value.trim() || null,
-      };
-      if (!payload.plate) return showToast("Kennzeichen ist Pflicht.");
-
-      if (isEdit){
-        const { error } = await supabase.from("visitor_permits").update(payload).eq("id", id);
-        if (error) return showToast("Speichern fehlgeschlagen: " + error.message);
-      }else{
-        payload.created_by = session.user.id;
-        const { error } = await supabase.from("visitor_permits").insert(payload);
-        if (error) return showToast("Erstellen fehlgeschlagen: " + error.message);
-      }
-
-      showToast("Gespeichert.");
-      location.hash = "#/visitors";
-    });
-
-    const card = el("section",{class:"card"}, el("div",{class:"section"},[
-      el("div",{class:"h1"}, isEdit ? "Bewilligung bearbeiten" : "Neue Bewilligung"),
-      el("div",{class:"muted"},"Gültigkeitsfenster definieren (optional)."),
-      el("hr",{class:"sep"}),
-      el("div",{class:"col"},[
-        el("div",{class:"row"},[propertySel, areaSel]),
-        plate, name,
-        el("div",{class:"row"},[from,to]),
-        notes,
-        el("div",{class:"row"},[btnSave, btnBack])
-      ])
-    ]));
-
-    app.appendChild(card);
-  }
-
-  function toLocalInput(d){
-    const pad=(n)=>String(n).padStart(2,"0");
-    return `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
-  }
-
-  await loadPermits();
-  if (createNew) openPermitEditor();
-});
-
-// Settings / Profile
-route("#/settings", async ()=>{
-  if (!requireAuth()) return;
-  bottomNav.hidden = false;
-
-  await loadProfile();
-  await loadOrgs();
-
-  app.innerHTML = "";
-
-  const first = el("input",{class:"input",placeholder:"Vorname"});
-  const last = el("input",{class:"input",placeholder:"Nachname"});
-  const company = el("input",{class:"input",placeholder:"Firmenname"});
-  const street = el("input",{class:"input",placeholder:"Strasse"});
-  const plz = el("input",{class:"input",placeholder:"PLZ"});
-  const city = el("input",{class:"input",placeholder:"Stadt"});
-  const phone = el("input",{class:"input",placeholder:"Telefon"});
-  const email = el("input",{class:"input",placeholder:"E‑mail",disabled:"true"});
-
-  first.value = profile?.first_name || "";
-  last.value = profile?.last_name || "";
-  company.value = profile?.company_name || "";
-  street.value = profile?.street || "";
-  plz.value = profile?.postal_code || "";
-  city.value = profile?.city || "";
-  phone.value = profile?.phone || "";
-  email.value = session?.user?.email || "";
-
-  const btnSave = el("button",{class:"btn"}, "Profil speichern");
-  btnSave.addEventListener("click", async ()=>{
-    const patch = {
-      first_name: first.value.trim() || null,
-      last_name: last.value.trim() || null,
-      company_name: company.value.trim() || null,
-      street: street.value.trim() || null,
-      postal_code: plz.value.trim() || null,
-      city: city.value.trim() || null,
-      phone: phone.value.trim() || null,
-      email: session.user.email || null
-    };
-    const { error } = await supabase.from("profiles").update(patch).eq("id", session.user.id);
-    if (error) return showToast("Speichern fehlgeschlagen: " + error.message);
-    showToast("Gespeichert.");
-    await loadProfile();
-  });
-
-  const orgBox = el("div",{class:"kv"},[
-    el("div",{class:"k"},"Organisation"),
-    el("div",{class:"v"}, activeOrg?.name || "—"),
-    el("div",{class:"small"}, "Mehrere Organisationen sind möglich (z.B. mehrere Mandate).")
+  const head = el("div", { class: "row spread" }, [
+    el("div", { class: "title", html: "Mandate" }),
+    el("button", { class: "btn", onClick: closeOrgSheet }, [el("span", { html: "Schliessen" })])
   ]);
 
-  const btnNewOrg = el("button",{class:"btn secondary",type:"button"}, "Neue Organisation anlegen");
-  btnNewOrg.addEventListener("click", ()=> location.hash="#/onboarding");
-
-  const card = el("section",{class:"card"}, el("div",{class:"section"},[
-    el("div",{class:"h1"},"Profil"),
-    el("div",{class:"muted"},"Kontakt-/Rechnungsdaten für den Mandanten."),
-    el("hr",{class:"sep"}),
-    el("div",{class:"col"},[
-      first,last,company,street,
-      el("div",{class:"row"},[plz,city]),
-      phone,email,
-      el("div",{class:"row"},[btnSave]),
-      el("hr",{class:"sep"}),
-      orgBox,
-      btnNewOrg
+  const actions = el("div", { class: "actions" }, [
+    el("button", { class: "btn primary", onClick: () => { closeOrgSheet(); location.hash = "#/onboarding"; } }, [
+      el("span", { html: icon("plus") }), el("span", { html: "Neues Mandat" })
     ])
-  ]));
+  ]);
 
-  app.appendChild(card);
-});
+  sheet.append(head, el("div", { class: "sep" }), list, el("div", { class: "sep" }), actions);
+  modal.append(sheet);
+  document.body.append(modal);
+  refresh();
 
-// 404
-route("#/404", async ()=>{
-  app.innerHTML = "";
-  app.appendChild(el("section",{class:"card"}, el("div",{class:"section"},[
-    el("div",{class:"h1"},"Seite nicht gefunden"),
-    el("div",{class:"muted"},"Bitte zurück zur Startseite."),
-    el("div",{style:"height:10px"}),
-    el("button",{class:"btn",onclick:()=>location.hash="#/home"},"Home")
-  ])));
-});
-
-// ====== Property manager modal-like view (simple) ======
-async function openPropertyManager(){
-  if (!requireAuth()) return;
-  await loadOrgs();
-  if (!requireOrg()) return;
-
-  app.innerHTML = "";
-
-  const head = el("section",{class:"card"}, el("div",{class:"section"},[
-    el("div",{class:"h1"},"Liegenschaften & Parkbereiche"),
-    el("div",{class:"muted"},"Alles, was Mandanten selbst pflegen sollen."),
-    el("div",{style:"height:10px"}),
-    el("button",{class:"btn ghost",onclick:()=>location.hash="#/home"},"Zurück")
-  ]));
-
-  const propList = el("div",{class:"list", id:"propList"}, "Lade…");
-
-  const form = el("section",{class:"card"}, el("div",{class:"section"},[
-    el("div",{class:"h1"},"Neue Liegenschaft"),
-    el("div",{class:"col"},[
-      el("input",{class:"input",placeholder:"Name der Immobilie", id:"p_name"}),
-      el("input",{class:"input",placeholder:"Strasse", id:"p_street"}),
-      el("div",{class:"row"},[
-        el("input",{class:"input",placeholder:"PLZ", id:"p_plz"}),
-        el("input",{class:"input",placeholder:"Stadt", id:"p_city"}),
-      ]),
-      el("textarea",{class:"textarea",placeholder:"Notizen", id:"p_notes"}),
-      el("button",{class:"btn",type:"button",onclick:()=>createProperty()},"Speichern"),
-    ])
-  ]));
-
-  const areaForm = el("section",{class:"card"}, el("div",{class:"section"},[
-    el("div",{class:"h1"},"Parkbereich hinzufügen"),
-    el("div",{class:"muted", id:"areaHint"},"Bitte zuerst eine Liegenschaft wählen."),
-    el("div",{class:"col"},[
-      el("input",{class:"input",placeholder:"Bereich/Platz (z.B. TG Platz 12)", id:"a_name", disabled:"true"}),
-      el("textarea",{class:"textarea",placeholder:"Notizen", id:"a_notes", disabled:"true"}),
-      el("button",{class:"btn secondary",type:"button",onclick:()=>createArea(), id:"a_btn", disabled:"true"},"Hinzufügen")
-    ])
-  ]));
-
-  app.appendChild(head);
-  app.appendChild(el("section",{class:"card"}, el("div",{class:"section"},[
-    el("div",{class:"h1"},"Übersicht"),
-    el("div",{class:"muted"},"Tippe eine Liegenschaft an, um Bereiche zu sehen."),
-    el("div",{style:"height:10px"}),
-    propList
-  ])));
-  app.appendChild(form);
-  app.appendChild(areaForm);
-
-  let selectedProperty = null;
-
-  async function loadProperties(){
-    const { data, error } = await supabase
-      .from("properties")
-      .select("id,name,street,postal_code,city,notes,created_at")
-      .eq("org_id", activeOrg.id)
-      .order("created_at",{ascending:false});
-    if (error) return (propList.textContent = "Fehler: "+error.message);
-
-    propList.innerHTML = "";
-    if (!data?.length){
-      propList.appendChild(el("div",{class:"muted"},"Noch keine Liegenschaft."));
-      return;
-    }
-
-    for (const p of data){
-      const item = el("div",{class:"item"},[
-        el("div",{class:"item-top"},[
-          el("div",{},[
-            el("div",{class:"item-title"}, p.name),
-            el("div",{class:"item-sub"}, [p.street, [p.postal_code,p.city].filter(Boolean).join(" ")].filter(Boolean).join(", ") || "—")
-          ]),
-          el("div",{class:"pill"}, selectedProperty?.id===p.id ? "Aktiv" : "—")
-        ]),
-        p.notes ? el("div",{class:"small"}, p.notes) : null,
-        el("div",{class:"row"},[
-          el("button",{class:"btn ghost",onclick:()=>selectProperty(p)},"Wählen"),
-          el("button",{class:"btn danger",onclick:()=>deleteProperty(p.id)},"Löschen")
-        ]),
-        el("div",{class:"small", id:`areas-${p.id}`}, "")
-      ]);
-      propList.appendChild(item);
-
-      // load areas
-      const areasEl = item.querySelector(`#areas-${p.id}`);
-      const { data:areas } = await supabase
-        .from("parking_areas")
-        .select("id,name,notes,is_active")
-        .eq("org_id", activeOrg.id)
-        .eq("property_id", p.id)
-        .order("created_at",{ascending:false});
-
-      if (areas?.length){
-        areasEl.innerHTML = "<b>Bereiche:</b> " + areas.map(a=>a.name).join(" · ");
-      }else{
-        areasEl.textContent = "Keine Bereiche";
-      }
-    }
-  }
-
-  function selectProperty(p){
-    selectedProperty = p;
-    $("#areaHint").textContent = `Ausgewählt: ${p.name}`;
-    $("#a_name").disabled = false;
-    $("#a_notes").disabled = false;
-    $("#a_btn").disabled = false;
-    showToast("Liegenschaft gewählt.");
-    loadProperties();
-  }
-
-  async function createProperty(){
-    const name = $("#p_name").value.trim();
-    if (!name) return showToast("Name ist Pflicht.");
-    const payload = {
-      org_id: activeOrg.id,
-      created_by: session.user.id,
-      name,
-      street: $("#p_street").value.trim() || null,
-      postal_code: $("#p_plz").value.trim() || null,
-      city: $("#p_city").value.trim() || null,
-      notes: $("#p_notes").value.trim() || null,
-      country: "CH"
-    };
-    const { error } = await supabase.from("properties").insert(payload);
-    if (error) return showToast("Speichern fehlgeschlagen: " + error.message);
-    $("#p_name").value=""; $("#p_street").value=""; $("#p_plz").value=""; $("#p_city").value=""; $("#p_notes").value="";
-    showToast("Liegenschaft gespeichert.");
-    loadProperties();
-  }
-
-  async function createArea(){
-    if (!selectedProperty) return showToast("Bitte zuerst Liegenschaft wählen.");
-    const name = $("#a_name").value.trim();
-    if (!name) return showToast("Bereich-Name ist Pflicht.");
-    const payload = {
-      org_id: activeOrg.id,
-      property_id: selectedProperty.id,
-      created_by: session.user.id,
-      name,
-      notes: $("#a_notes").value.trim() || null,
-      is_active: true
-    };
-    const { error } = await supabase.from("parking_areas").insert(payload);
-    if (error) return showToast("Hinzufügen fehlgeschlagen: " + error.message);
-    $("#a_name").value=""; $("#a_notes").value="";
-    showToast("Bereich hinzugefügt.");
-    loadProperties();
-  }
-
-  async function deleteProperty(id){
-    if (!confirm("Liegenschaft löschen? (löscht auch Parkbereiche & Bezüge)")) return;
-    const { error } = await supabase.from("properties").delete().eq("id", id).eq("org_id", activeOrg.id);
-    if (error) return showToast("Löschen fehlgeschlagen: " + error.message);
-    if (selectedProperty?.id === id) selectedProperty = null;
-    showToast("Gelöscht.");
-    loadProperties();
-  }
-
-  await loadProperties();
+  // update when reopened
+  modal.addEventListener("transitionstart", refresh);
+  return modal;
 }
 
-// ====== Start ======
-(async ()=>{
-  await loadSession();
-  if (session){
-    await bootstrap();
-    if (!location.hash || location.hash.startsWith("#/login") || location.hash.startsWith("#/register")){
-      location.hash = "#/home";
-    } else {
-      await navigate();
+// ---------- Pages ----------
+function LoginPage() {
+  const email = el("input", { class: "input", type: "email", placeholder: "E-Mail", autocomplete: "email" });
+  const pass = el("input", { class: "input", type: "password", placeholder: "Passwort", autocomplete: "current-password" });
+
+  const btn = el("button", { class: "btn primary", onClick: async () => {
+    btn.disabled = true;
+    try {
+      const { error } = await supabase.auth.signInWithPassword({ email: email.value.trim(), password: pass.value });
+      if (error) throw error;
+      showToast("Eingeloggt.");
+      location.hash = "#/";
+    } catch (e) {
+      showToast(e.message || "Login fehlgeschlagen");
+    } finally {
+      btn.disabled = false;
     }
-  } else {
-    location.hash = "#/login";
-    await navigate();
+  } }, [el("span", { html: "Login" })]);
+
+  const body = el("div", {}, [
+    el("div", { class: "field" }, [el("div", { class: "label", html: "E-Mail" }), email]),
+    el("div", { class: "field" }, [el("div", { class: "label", html: "Passwort" }), pass]),
+    el("div", { class: "row spread" }, [
+      btn,
+      el("button", { class: "btn", onClick: () => location.hash = "#/register" }, [el("span", { html: "Registrieren" })])
+    ]),
+    el("div", { class: "sep" }),
+    el("div", { class: "muted small", html: "Hinweis: Nach Registrierung kann eine E-Mail-Bestätigung nötig sein (je nach Supabase-Einstellung)." })
+  ]);
+  return CenterCard("Anmelden", body);
+}
+
+function RegisterPage() {
+  const email = el("input", { class: "input", type: "email", placeholder: "E-Mail", autocomplete: "email" });
+  const pass = el("input", { class: "input", type: "password", placeholder: "Passwort (min. 8 Zeichen)", autocomplete: "new-password" });
+
+  const btn = el("button", { class: "btn primary", onClick: async () => {
+    btn.disabled = true;
+    try {
+      const { data, error } = await supabase.auth.signUp({
+        email: email.value.trim(),
+        password: pass.value,
+        options: {
+          emailRedirectTo: location.origin + location.pathname + "#/"
+        }
+      });
+      if (error) throw error;
+
+      if (data?.user && !data?.session) {
+        showToast("Registriert. Bitte E-Mail bestätigen und dann einloggen.");
+        location.hash = "#/login";
+      } else {
+        showToast("Registriert & eingeloggt.");
+        location.hash = "#/onboarding";
+      }
+    } catch (e) {
+      showToast(e.message || "Registrierung fehlgeschlagen");
+    } finally {
+      btn.disabled = false;
+    }
+  } }, [el("span", { html: "Konto erstellen" })]);
+
+  const body = el("div", {}, [
+    el("div", { class: "field" }, [el("div", { class: "label", html: "E-Mail" }), email]),
+    el("div", { class: "field" }, [el("div", { class: "label", html: "Passwort" }), pass]),
+    el("div", { class: "row spread" }, [
+      btn,
+      el("button", { class: "btn", onClick: () => location.hash = "#/login" }, [el("span", { html: "Zurück" })])
+    ])
+  ]);
+
+  return CenterCard("Registrieren", body);
+}
+
+function OnboardingPage() {
+  if (!requireAuth()) return CenterCard("Weiterleitung…", el("div"));
+  const orgName = el("input", { class: "input", placeholder: "z.B. Muster Verwaltung AG" });
+  const propName = el("input", { class: "input", placeholder: "z.B. Liegenschaft Bahnhofstrasse 1" });
+  const propAddr = el("input", { class: "input", placeholder: "Adresse (optional)" });
+
+  const btn = el("button", { class: "btn primary", onClick: async () => {
+    btn.disabled = true;
+    try {
+      const name = orgName.value.trim();
+      if (!name) throw new Error("Bitte Mandatsname angeben.");
+
+      // Create org; trigger creates owner membership
+      const { data: org, error: e1 } = await supabase
+        .from("organizations")
+        .insert({ name, created_by: state.session.user.id })
+        .select("id,name")
+        .single();
+      if (e1) throw e1;
+
+      // Optional property
+      if (propName.value.trim()) {
+        const { error: e2 } = await supabase.from("properties").insert({
+          org_id: org.id,
+          name: propName.value.trim(),
+          address: propAddr.value.trim() || null
+        });
+        if (e2) throw e2;
+      }
+
+      showToast("Mandat erstellt.");
+      await loadContext();
+      location.hash = "#/";
+    } catch (e) {
+      showToast(e.message || "Onboarding fehlgeschlagen");
+    } finally {
+      btn.disabled = false;
+    }
+  } }, [el("span", { html: "Mandat erstellen" })]);
+
+  const body = el("div", {}, [
+    el("div", { class: "muted small", html: "Erstelle dein erstes Mandat. Danach kannst du Liegenschaften, Besucherbewilligungen und Verstösse verwalten." }),
+    el("div", { class: "sep" }),
+    el("div", { class: "field" }, [el("div", { class: "label", html: "Mandat / Organisation" }), orgName]),
+    el("div", { class: "two" }, [
+      el("div", { class: "field" }, [el("div", { class: "label", html: "Erste Liegenschaft (optional)" }), propName]),
+      el("div", { class: "field" }, [el("div", { class: "label", html: "Adresse (optional)" }), propAddr]),
+    ]),
+    el("div", { class: "row spread" }, [
+      btn,
+      el("button", { class: "btn", onClick: () => location.hash = "#/" }, [el("span", { html: "Überspringen" })])
+    ])
+  ]);
+
+  return CenterCard("Onboarding", body);
+}
+
+async function DashboardPage() {
+  if (!requireAuth()) return CenterCard("Weiterleitung…", el("div"));
+
+  if (!state.orgs.length) return OnboardingPage();
+
+  const org_id = state.activeOrgId;
+
+  const [props, permits, reports] = await Promise.all([
+    supabase.from("properties").select("id", { count: "exact", head: true }).eq("org_id", org_id),
+    supabase.from("visitor_permits").select("id", { count: "exact", head: true }).eq("org_id", org_id),
+    supabase.from("reports").select("id", { count: "exact", head: true }).eq("org_id", org_id),
+  ]);
+
+  const k1 = props.count ?? 0;
+  const k2 = permits.count ?? 0;
+  const k3 = reports.count ?? 0;
+
+  const kpis = el("div", { class: "kpis" }, [
+    el("div", { class: "kpi" }, [el("div", { class: "v", html: String(k1) }), el("div", { class: "l", html: "Liegenschaften" })]),
+    el("div", { class: "kpi" }, [el("div", { class: "v", html: String(k2) }), el("div", { class: "l", html: "Besucherbewilligungen" })]),
+    el("div", { class: "kpi" }, [el("div", { class: "v", html: String(k3) }), el("div", { class: "l", html: "Verstösse (Reports)" })]),
+    el("div", { class: "kpi" }, [el("div", { class: "v", html: "∞" }), el("div", { class: "l", html: "Digitaler Vorsprung" })]),
+  ]);
+
+  const quick = el("div", { class: "row wrap" }, [
+    el("button", { class: "btn primary", onClick: () => location.hash = "#/reports?new=1" }, [el("span", { html: icon("plus") }), el("span", { html: "Neuer Verstoss" })]),
+    el("button", { class: "btn", onClick: () => location.hash = "#/permits?new=1" }, [el("span", { html: icon("plus") }), el("span", { html: "Neue Besucherbewilligung" })]),
+    el("button", { class: "btn", onClick: () => location.hash = "#/properties?new=1" }, [el("span", { html: icon("plus") }), el("span", { html: "Neue Liegenschaft" })]),
+  ]);
+
+  const panel = el("div", { class: "card" }, [
+    el("div", { class: "hd" }, [el("h2", { html: "Übersicht" })]),
+    el("div", { class: "bd" }, [kpis, el("div", { class: "sep" }), quick])
+  ]);
+
+  return panel;
+}
+
+function parseQuery() {
+  const h = location.hash || "#/";
+  const i = h.indexOf("?");
+  if (i === -1) return {};
+  const q = h.slice(i + 1);
+  const params = new URLSearchParams(q);
+  const obj = {};
+  for (const [k, v] of params.entries()) obj[k] = v;
+  return obj;
+}
+
+async function PropertiesPage() {
+  if (!requireAuth()) return CenterCard("Weiterleitung…", el("div"));
+  if (!state.orgs.length) return OnboardingPage();
+
+  const org_id = state.activeOrgId;
+
+  const { data, error } = await supabase.from("properties").select("*").eq("org_id", org_id).order("created_at", { ascending: false });
+  if (error) return CenterCard("Fehler", el("div", { html: error.message }));
+
+  const list = el("div", { class: "list" });
+  for (const p of data || []) {
+    list.append(
+      el("div", { class: "item" }, [
+        el("div", {}, [
+          el("div", { class: "title", html: p.name }),
+          el("div", { class: "sub", html: p.address || "—" })
+        ]),
+        el("div", { class: "row" }, [
+          el("button", { class: "btn", onClick: () => openPropertyModal(p) }, [el("span", { html: "Bearbeiten" })]),
+          el("button", { class: "btn danger", onClick: async () => {
+            if (!confirm("Liegenschaft löschen?")) return;
+            const { error: e2 } = await supabase.from("properties").delete().eq("id", p.id);
+            if (e2) showToast(e2.message);
+            else { showToast("Gelöscht."); render(); }
+          } }, [el("span", { html: "Löschen" })])
+        ])
+      ])
+    );
   }
-})();
+
+  const addBtn = el("button", { class: "btn primary", onClick: () => openPropertyModal(null) }, [
+    el("span", { html: icon("plus") }), el("span", { html: "Liegenschaft hinzufügen" })
+  ]);
+
+  const card = el("div", { class: "card" }, [
+    el("div", { class: "hd" }, [
+      el("h2", { html: "Liegenschaften" }),
+      addBtn
+    ]),
+    el("div", { class: "bd" }, [
+      data?.length ? list : el("div", { class: "muted", html: "Noch keine Liegenschaften." })
+    ])
+  ]);
+
+  // Auto-open via query
+  const q = parseQuery();
+  if (q.new === "1") setTimeout(() => openPropertyModal(null), 50);
+
+  return card;
+
+  function openPropertyModal(prop) {
+    const modal = el("div", { class: "modal open", onClick: (e) => { if (e.target === modal) close(); } });
+    const name = el("input", { class: "input", placeholder: "Name", value: prop?.name || "" });
+    const addr = el("input", { class: "input", placeholder: "Adresse", value: prop?.address || "" });
+
+    const save = el("button", { class: "btn primary", onClick: async () => {
+      save.disabled = true;
+      try {
+        if (!name.value.trim()) throw new Error("Name fehlt.");
+        if (prop) {
+          const { error: e } = await supabase.from("properties").update({ name: name.value.trim(), address: addr.value.trim() || null }).eq("id", prop.id);
+          if (e) throw e;
+          showToast("Gespeichert.");
+        } else {
+          const { error: e } = await supabase.from("properties").insert({ org_id, name: name.value.trim(), address: addr.value.trim() || null });
+          if (e) throw e;
+          showToast("Erstellt.");
+        }
+        close();
+        render();
+      } catch (e) {
+        showToast(e.message || "Speichern fehlgeschlagen");
+      } finally {
+        save.disabled = false;
+      }
+    } }, [el("span", { html: "Speichern" })]);
+
+    const sheet = el("div", { class: "sheet" }, [
+      el("div", { class: "row spread" }, [
+        el("div", { class: "title", html: prop ? "Liegenschaft bearbeiten" : "Neue Liegenschaft" }),
+        el("button", { class: "btn", onClick: close }, [el("span", { html: "Schliessen" })])
+      ]),
+      el("div", { class: "sep" }),
+      el("div", { class: "field" }, [el("div", { class: "label", html: "Name" }), name]),
+      el("div", { class: "field" }, [el("div", { class: "label", html: "Adresse" }), addr]),
+      el("div", { class: "actions" }, [save])
+    ]);
+
+    modal.append(sheet);
+    document.body.append(modal);
+    function close() { modal.remove(); }
+  }
+}
+
+async function PermitsPage() {
+  if (!requireAuth()) return CenterCard("Weiterleitung…", el("div"));
+  if (!state.orgs.length) return OnboardingPage();
+
+  const org_id = state.activeOrgId;
+  const q = parseQuery();
+
+  const search = el("input", { class: "input", placeholder: "Suchen: Kennzeichen / Name" });
+
+  const { data, error } = await supabase
+    .from("visitor_permits")
+    .select("*")
+    .eq("org_id", org_id)
+    .order("created_at", { ascending: false })
+    .limit(200);
+
+  if (error) return CenterCard("Fehler", el("div", { html: error.message }));
+
+  const list = el("div", { class: "list" });
+
+  function renderList(filter = "") {
+    list.innerHTML = "";
+    const f = filter.trim().toLowerCase();
+    const rows = (data || []).filter(r => {
+      if (!f) return true;
+      return (r.plate || "").toLowerCase().includes(f) || (r.visitor_name || "").toLowerCase().includes(f);
+    });
+
+    for (const r of rows) {
+      const valid = (!r.valid_to) || (new Date(r.valid_to) > new Date());
+      list.append(
+        el("div", { class: "item" }, [
+          el("div", {}, [
+            el("div", { class: "title", html: (r.plate || "—").toUpperCase() }),
+            el("div", { class: "sub", html: `${r.visitor_name || "Besucher"} • gültig bis ${r.valid_to ? fmtDate(r.valid_to) : "offen"}` })
+          ]),
+          el("div", { class: "row" }, [
+            el("span", { class: "badge", html: valid ? "Aktiv" : "Abgelaufen", style: valid ? "color:var(--good)" : "color:var(--warn)" }),
+            el("button", { class: "btn danger", onClick: async () => {
+              if (!confirm("Bewilligung widerrufen/löschen?")) return;
+              const { error: e2 } = await supabase.from("visitor_permits").delete().eq("id", r.id);
+              if (e2) showToast(e2.message);
+              else { showToast("Entfernt."); location.hash = "#/permits"; render(); }
+            } }, [el("span", { html: "Entfernen" })])
+          ])
+        ])
+      );
+    }
+
+    if (!rows.length) list.append(el("div", { class: "muted", html: "Keine passenden Bewilligungen." }));
+  }
+
+  search.addEventListener("input", () => renderList(search.value));
+  renderList("");
+
+  const addBtn = el("button", { class: "btn primary", onClick: () => openPermitModal(null) }, [
+    el("span", { html: icon("plus") }), el("span", { html: "Bewilligung erstellen" })
+  ]);
+
+  const card = el("div", { class: "card" }, [
+    el("div", { class: "hd" }, [el("h2", { html: "Besucherbewilligungen" }), addBtn]),
+    el("div", { class: "bd" }, [
+      el("div", { class: "field" }, [el("div", { class: "label", html: "Suche" }), search]),
+      list
+    ])
+  ]);
+
+  if (q.new === "1") setTimeout(() => openPermitModal(null), 50);
+  return card;
+
+  async function openPermitModal(row) {
+    const modal = el("div", { class: "modal open", onClick: (e) => { if (e.target === modal) close(); } });
+    const plate = el("input", { class: "input", placeholder: "Kennzeichen", value: row?.plate || "" });
+    const name = el("input", { class: "input", placeholder: "Besuchername (optional)", value: row?.visitor_name || "" });
+    const from = el("input", { class: "input", type: "datetime-local" });
+    const to = el("input", { class: "input", type: "datetime-local" });
+
+    const { data: props } = await supabase.from("properties").select("id,name").eq("org_id", org_id).order("created_at", { ascending: false });
+    const propSel = el("select", { class: "input" }, [
+      el("option", { value: "" }, [document.createTextNode("— (keine Liegenschaft) —")]),
+      ...(props || []).map(p => el("option", { value: p.id }, [document.createTextNode(p.name)]))
+    ]);
+
+    const save = el("button", { class: "btn primary", onClick: async () => {
+      save.disabled = true;
+      try {
+        if (!plate.value.trim()) throw new Error("Kennzeichen fehlt.");
+        const payload = {
+          org_id,
+          plate: plate.value.trim(),
+          visitor_name: name.value.trim() || null,
+          property_id: propSel.value || null,
+          valid_from: from.value ? new Date(from.value).toISOString() : null,
+          valid_to: to.value ? new Date(to.value).toISOString() : null
+        };
+        const { error: e } = await supabase.from("visitor_permits").insert(payload);
+        if (e) throw e;
+        showToast("Bewilligung erstellt.");
+        close(); render();
+      } catch (e) {
+        showToast(e.message || "Fehler");
+      } finally { save.disabled = false; }
+    } }, [el("span", { html: "Speichern" })]);
+
+    const sheet = el("div", { class: "sheet" }, [
+      el("div", { class: "row spread" }, [
+        el("div", { class: "title", html: "Neue Bewilligung" }),
+        el("button", { class: "btn", onClick: close }, [el("span", { html: "Schliessen" })])
+      ]),
+      el("div", { class: "sep" }),
+      el("div", { class: "two" }, [
+        el("div", { class: "field" }, [el("div", { class: "label", html: "Kennzeichen" }), plate]),
+        el("div", { class: "field" }, [el("div", { class: "label", html: "Besucher" }), name]),
+      ]),
+      el("div", { class: "two" }, [
+        el("div", { class: "field" }, [el("div", { class: "label", html: "Gültig ab" }), from]),
+        el("div", { class: "field" }, [el("div", { class: "label", html: "Gültig bis" }), to]),
+      ]),
+      el("div", { class: "field" }, [el("div", { class: "label", html: "Liegenschaft (optional)" }), propSel]),
+      el("div", { class: "actions" }, [save])
+    ]);
+
+    modal.append(sheet);
+    document.body.append(modal);
+    function close() { modal.remove(); }
+  }
+}
+
+async function ReportsPage() {
+  if (!requireAuth()) return CenterCard("Weiterleitung…", el("div"));
+  if (!state.orgs.length) return OnboardingPage();
+
+  const org_id = state.activeOrgId;
+  const q = parseQuery();
+
+  const { data, error } = await supabase
+    .from("reports")
+    .select("id,created_at,plate,location_text,notes,status")
+    .eq("org_id", org_id)
+    .order("created_at", { ascending: false })
+    .limit(200);
+
+  if (error) return CenterCard("Fehler", el("div", { html: error.message }));
+
+  const list = el("div", { class: "list" });
+  for (const r of data || []) {
+    list.append(
+      el("div", { class: "item" }, [
+        el("div", {}, [
+          el("div", { class: "title", html: (r.plate || "—").toUpperCase() }),
+          el("div", { class: "sub", html: `${fmtDateTime(r.created_at)} • ${r.location_text || "—"}` }),
+          r.notes ? el("div", { class: "sub", html: r.notes }) : el("span")
+        ]),
+        el("span", { class: "badge", html: r.status || "open" })
+      ])
+    );
+  }
+
+  const addBtn = el("button", { class: "btn primary", onClick: () => openReportModal() }, [
+    el("span", { html: icon("plus") }), el("span", { html: "Neuer Verstoss" })
+  ]);
+
+  const card = el("div", { class: "card" }, [
+    el("div", { class: "hd" }, [el("h2", { html: "Verstösse" }), addBtn]),
+    el("div", { class: "bd" }, [
+      data?.length ? list : el("div", { class: "muted", html: "Noch keine Reports." })
+    ])
+  ]);
+
+  if (q.new === "1") setTimeout(openReportModal, 50);
+  return card;
+
+  async function openReportModal() {
+    const modal = el("div", { class: "modal open", onClick: (e) => { if (e.target === modal) close(); } });
+
+    const plate = el("input", { class: "input", placeholder: "Kennzeichen" });
+    const locationText = el("input", { class: "input", placeholder: "Ort / Parkplatz / Bemerkung" });
+    const notes = el("textarea", { class: "input", placeholder: "Notizen (optional)", rows: "3" });
+
+    const photoInput = el("input", { class: "input", type: "file", accept: "image/*", capture: "environment" });
+    const geoBtn = el("button", { class: "btn", onClick: async () => {
+      geoBtn.disabled = true;
+      try {
+        const pos = await new Promise((resolve, reject) => {
+          navigator.geolocation.getCurrentPosition(resolve, reject, { enableHighAccuracy: true, timeout: 8000 });
+        });
+        modal._geo = { lat: pos.coords.latitude, lng: pos.coords.longitude, accuracy_m: pos.coords.accuracy };
+        showToast("Position erfasst.");
+      } catch (e) {
+        showToast("Position nicht verfügbar.");
+      } finally { geoBtn.disabled = false; }
+    } }, [el("span", { html: "Position erfassen" })]);
+
+    // Optional property selector
+    const { data: props } = await supabase.from("properties").select("id,name").eq("org_id", org_id).order("created_at", { ascending: false });
+    const propSel = el("select", { class: "input" }, [
+      el("option", { value: "" }, [document.createTextNode("— Liegenschaft wählen (optional) —")]),
+      ...(props || []).map(p => el("option", { value: p.id }, [document.createTextNode(p.name)]))
+    ]);
+
+    const save = el("button", { class: "btn primary", onClick: async () => {
+      save.disabled = true;
+      try {
+        if (!plate.value.trim()) throw new Error("Kennzeichen fehlt.");
+
+        // 1) Create report
+        const payload = {
+          org_id,
+          plate: plate.value.trim(),
+          property_id: propSel.value || null,
+          location_text: locationText.value.trim() || null,
+          notes: notes.value.trim() || null,
+          lat: modal._geo?.lat || null,
+          lng: modal._geo?.lng || null,
+          accuracy_m: modal._geo?.accuracy_m || null,
+          status: "open"
+        };
+
+        const { data: rep, error: e1 } = await supabase.from("reports").insert(payload).select("id").single();
+        if (e1) throw e1;
+
+        // 2) Upload photo if present
+        const file = photoInput.files?.[0];
+        if (file) {
+          const resized = await resizeImage(file, 1600, 0.85);
+          const path = `org/${org_id}/reports/${rep.id}/${Date.now()}-${safeName(file.name || "photo.jpg")}`;
+          const { error: eUp } = await supabase.storage.from("captures").upload(path, resized, { upsert: false, contentType: resized.type });
+          if (eUp) throw eUp;
+
+          const { error: e2 } = await supabase.from("report_photos").insert({
+            org_id,
+            report_id: rep.id,
+            storage_path: path,
+            content_type: resized.type,
+            bytes: resized.size
+          });
+          if (e2) throw e2;
+        }
+
+        showToast("Report erstellt.");
+        close(); render();
+
+      } catch (e) {
+        showToast(e.message || "Fehler");
+      } finally { save.disabled = false; }
+    } }, [el("span", { html: "Speichern" })]);
+
+    const sheet = el("div", { class: "sheet" }, [
+      el("div", { class: "row spread" }, [
+        el("div", { class: "title", html: "Neuer Verstoss" }),
+        el("button", { class: "btn", onClick: close }, [el("span", { html: "Schliessen" })])
+      ]),
+      el("div", { class: "sep" }),
+      el("div", { class: "two" }, [
+        el("div", { class: "field" }, [el("div", { class: "label", html: "Kennzeichen" }), plate]),
+        el("div", { class: "field" }, [el("div", { class: "label", html: "Liegenschaft" }), propSel]),
+      ]),
+      el("div", { class: "field" }, [el("div", { class: "label", html: "Ort" }), locationText]),
+      el("div", { class: "field" }, [el("div", { class: "label", html: "Notizen" }), notes]),
+      el("div", { class: "two" }, [
+        el("div", { class: "field" }, [el("div", { class: "label", html: "Foto (optional)" }), photoInput]),
+        el("div", { class: "field" }, [el("div", { class: "label", html: "GPS" }), geoBtn]),
+      ]),
+      el("div", { class: "actions" }, [save])
+    ]);
+
+    modal.append(sheet);
+    document.body.append(modal);
+    function close() { modal.remove(); }
+  }
+}
+
+function SettingsPage() {
+  if (!requireAuth()) return CenterCard("Weiterleitung…", el("div"));
+  const user = state.session?.user;
+
+  const body = el("div", { class: "card" }, [
+    el("div", { class: "hd" }, [el("h2", { html: "Settings" })]),
+    el("div", { class: "bd" }, [
+      el("div", { class: "list" }, [
+        el("div", { class: "item" }, [
+          el("div", {}, [
+            el("div", { class: "title", html: "Account" }),
+            el("div", { class: "sub", html: user?.email || "—" })
+          ]),
+          el("span", { class: "badge", html: "Supabase Auth" })
+        ]),
+        el("div", { class: "item" }, [
+          el("div", {}, [
+            el("div", { class: "title", html: "Mandat" }),
+            el("div", { class: "sub", html: state.activeOrgId ? (state.orgs.find(o=>o.id===state.activeOrgId)?.name || "—") : "—" })
+          ]),
+          el("button", { class: "btn", onClick: openOrgSheet }, [el("span", { html: "Wechseln" })])
+        ]),
+      ]),
+      el("div", { class: "sep" }),
+      el("div", { class: "row wrap" }, [
+        el("button", { class: "btn", onClick: () => location.hash = "#/onboarding" }, [el("span", { html: icon("plus") }), el("span", { html: "Neues Mandat" })]),
+        el("button", { class: "btn danger", onClick: async () => {
+          await supabase.auth.signOut();
+          showToast("Abgemeldet.");
+          location.hash = "#/login";
+        } }, [el("span", { html: "Abmelden" })])
+      ]),
+      el("div", { class: "sep" }),
+      el("div", { class: "muted small", html: "Updates: Diese PWA aktualisiert sich automatisch (kein Ctrl+F5 nötig)." })
+    ])
+  ]);
+
+  return body;
+}
+
+// ---------- Utils (photo resize) ----------
+function safeName(s) {
+  return (s || "file").replace(/[^a-zA-Z0-9._-]+/g, "_");
+}
+
+async function resizeImage(file, maxW = 1600, quality = 0.85) {
+  // Converts to JPEG (keeps original type if already jpeg/png but output as jpeg for size)
+  const img = await new Promise((resolve, reject) => {
+    const i = new Image();
+    i.onload = () => resolve(i);
+    i.onerror = reject;
+    i.src = URL.createObjectURL(file);
+  });
+
+  const ratio = Math.min(1, maxW / img.width);
+  const w = Math.round(img.width * ratio);
+  const h = Math.round(img.height * ratio);
+
+  const canvas = document.createElement("canvas");
+  canvas.width = w; canvas.height = h;
+  const ctx = canvas.getContext("2d");
+  ctx.drawImage(img, 0, 0, w, h);
+
+  const blob = await new Promise((resolve) => canvas.toBlob(resolve, "image/jpeg", quality));
+  return new File([blob], safeName(file.name || "photo.jpg").replace(/\.\w+$/, ".jpg"), { type: "image/jpeg" });
+}
+
+// ---------- Render ----------
+async function render() {
+  const h = route();
+
+  // If already logged in, never stay on login/register
+  if (state.session && routesPublic.has(h)) {
+    location.hash = \"#/\";
+    return;
+  }
+
+  // Guard: If logged in but no orgs, push onboarding (unless on public route)
+  if (state.session && !state.orgs.length && !routesPublic.has(h) && h !== "#/onboarding") {
+    location.hash = "#/onboarding";
+    return;
+  }
+
+  // Public routes
+  if (h.startsWith("#/login")) { PageShell("#/login", LoginPage()); return; }
+  if (h.startsWith("#/register")) { PageShell("#/register", RegisterPage()); return; }
+
+  // Private
+  if (!state.session) { PageShell("#/login", LoginPage()); return; }
+
+  if (h.startsWith("#/onboarding")) { PageShell("#/settings", OnboardingPage()); return; }
+
+  if (h === "#/" || h.startsWith("#/dashboard")) {
+    const node = await DashboardPage();
+    PageShell("#/", node);
+    return;
+  }
+  if (h.startsWith("#/properties")) {
+    const node = await PropertiesPage();
+    PageShell("#/properties", node);
+    return;
+  }
+  if (h.startsWith("#/permits")) {
+    const node = await PermitsPage();
+    PageShell("#/permits", node);
+    return;
+  }
+  if (h.startsWith("#/reports")) {
+    const node = await ReportsPage();
+    PageShell("#/reports", node);
+    return;
+  }
+  if (h.startsWith("#/settings")) {
+    const node = SettingsPage();
+    PageShell("#/settings", node);
+    return;
+  }
+
+  // Fallback
+  location.hash = "#/";
+}
+
