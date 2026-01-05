@@ -1,991 +1,1047 @@
-// web/app.js
-import { SUPABASE_URL, SUPABASE_ANON_KEY, APP_NAME } from "./config.js";
+// app.js - ParkPatrol Ultimate (Vanilla + Supabase)
+// Loaded with cache-buster from index.html to avoid GitHub Pages stale caches.
+
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 
-// Supabase client (persist session across reloads)
+// --------- dynamic config import (also cache-busted) ----------
+const _v = Date.now();
+const cfg = await import(`./config.js?v=${_v}`);
+const { SUPABASE_URL, SUPABASE_ANON_KEY, APP_NAME } = cfg;
+
+if (!SUPABASE_URL || !SUPABASE_ANON_KEY || SUPABASE_ANON_KEY.includes("PASTE_YOUR_SUPABASE")) {
+  console.warn("Supabase config missing. Fill SUPABASE_URL + SUPABASE_ANON_KEY in config.js");
+}
+
+// Supabase client: persist session across reloads
 const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
   auth: { persistSession: true, autoRefreshToken: true, detectSessionInUrl: true }
 });
 
-// ---------- PWA (no hard refresh needed) ----------
+// --------- PWA / Service Worker (no hard refresh needed) ----------
 async function registerServiceWorker() {
   if (!("serviceWorker" in navigator)) return;
-
   try {
-    const reg = await navigator.serviceWorker.register("./sw.js", { scope: "./" });
-
-    // Proactively check for updates on load
+    const reg = await navigator.serviceWorker.register("./sw.js", { scope: "./", updateViaCache: "none" });
+    // Proactively check for updates
     reg.update().catch(() => {});
-
-    // If a new SW is waiting, activate it immediately
-    if (reg.waiting) {
-      reg.waiting.postMessage({ type: "SKIP_WAITING" });
-    }
-
-    reg.addEventListener("updatefound", () => {
-      const nw = reg.installing;
-      if (!nw) return;
-      nw.addEventListener("statechange", () => {
-        if (nw.state === "installed" && navigator.serviceWorker.controller) {
-          showToast("Update verfügbar – App wird aktualisiert…");
-          nw.postMessage({ type: "SKIP_WAITING" });
-        }
-      });
-    });
-
-    // Reload once the new SW takes control (seamless update)
+    // If waiting, activate right away
+    if (reg.waiting) reg.waiting.postMessage({ type: "SKIP_WAITING" });
     navigator.serviceWorker.addEventListener("controllerchange", () => {
-      // Avoid infinite reloads
-      if (registerServiceWorker._reloaded) return;
-      registerServiceWorker._reloaded = true;
-      window.location.reload();
+      // Reload once to move onto the new SW.
+      location.reload();
     });
-
   } catch (e) {
-    // SW optional; app still works without it
-    console.warn("SW registration failed:", e);
+    console.warn("SW register failed", e);
   }
 }
 registerServiceWorker();
 
-// ---------- Tiny UI helpers ----------
-const $ = (sel) => document.querySelector(sel);
-const el = (tag, props = {}, children = []) => {
-  const n = document.createElement(tag);
-  for (const [k, v] of Object.entries(props)) {
-    if (k === "class") n.className = v;
-    else if (k === "html") n.innerHTML = v;
-    else if (k.startsWith("on") && typeof v === "function") n.addEventListener(k.slice(2), v);
-    else n.setAttribute(k, v);
-  }
-  for (const c of children) n.append(c);
-  return n;
+// --------- Utilities ----------
+const $ = (sel, el = document) => el.querySelector(sel);
+const $$ = (sel, el = document) => Array.from(el.querySelectorAll(sel));
+const escapeHtml = (s) => String(s ?? "").replace(/[&<>"']/g, (m) => ({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#039;" }[m]));
+const fmtDate = (iso) => {
+  if (!iso) return "";
+  const d = new Date(iso);
+  return d.toLocaleString("de-CH", { year:"numeric", month:"2-digit", day:"2-digit", hour:"2-digit", minute:"2-digit" });
 };
-
-const appRoot = $("#app");
-const toast = $("#toast");
-function showToast(msg, ms = 2300) {
-  toast.textContent = msg;
-  toast.hidden = false;
-  clearTimeout(showToast._t);
-  showToast._t = setTimeout(() => (toast.hidden = true), ms);
+function toast(msg, kind="") {
+  const el = document.createElement("div");
+  el.className = `notice ${kind}`.trim();
+  el.style.position = "fixed";
+  el.style.left = "50%";
+  el.style.transform = "translateX(-50%)";
+  el.style.bottom = "92px";
+  el.style.width = "min(980px, calc(100% - 24px))";
+  el.style.zIndex = "99";
+  el.innerHTML = escapeHtml(msg);
+  document.body.appendChild(el);
+  setTimeout(() => el.remove(), 4200);
 }
 
-function icon(name) {
-  // Minimal inline icon set
-  const map = {
-    home: `<svg viewBox="0 0 24 24" fill="none"><path d="M4 10.5L12 4l8 6.5V20a1 1 0 0 1-1 1h-5v-6H10v6H5a1 1 0 0 1-1-1v-9.5Z" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/></svg>`,
-    prop: `<svg viewBox="0 0 24 24" fill="none"><path d="M4 20V9l8-5 8 5v11" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/><path d="M9 20v-7h6v7" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/></svg>`,
-    permit: `<svg viewBox="0 0 24 24" fill="none"><path d="M7 7h10v14H7z" stroke="currentColor" stroke-width="1.8"/><path d="M9 3h6v4H9z" stroke="currentColor" stroke-width="1.8"/><path d="M9 11h6M9 14h6" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>`,
-    report: `<svg viewBox="0 0 24 24" fill="none"><path d="M7 3h7l3 3v15H7z" stroke="currentColor" stroke-width="1.8"/><path d="M9 10h6M9 13h6M9 16h5" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>`,
-    gear: `<svg viewBox="0 0 24 24" fill="none"><path d="M12 15.5a3.5 3.5 0 1 0 0-7 3.5 3.5 0 0 0 0 7Z" stroke="currentColor" stroke-width="1.8"/><path d="M19.4 15a8 8 0 0 0 .1-2l2-1.2-2-3.5-2.2.7a7.7 7.7 0 0 0-1.7-1L15 5h-4l-.6 2a7.7 7.7 0 0 0-1.7 1L6.5 7.3l-2 3.5 2 1.2a8 8 0 0 0 .1 2l-2 1.2 2 3.5 2.2-.7c.5.4 1.1.7 1.7 1l.6 2h4l.6-2c.6-.3 1.2-.6 1.7-1l2.2.7 2-3.5-2-1.2Z" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round"/></svg>`,
-    plus: `<svg viewBox="0 0 24 24" fill="none"><path d="M12 5v14M5 12h14" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"/></svg>`,
-    chevron: `<svg viewBox="0 0 24 24" fill="none"><path d="m9 18 6-6-6-6" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"/></svg>`,
-  };
-  return map[name] || "";
-}
-
-function fmtDateTime(s) {
-  if (!s) return "";
-  try {
-    return new Intl.DateTimeFormat("de-CH", { dateStyle: "medium", timeStyle: "short" }).format(new Date(s));
-  } catch {
-    return s;
-  }
-}
-function fmtDate(s) {
-  if (!s) return "";
-  try {
-    return new Intl.DateTimeFormat("de-CH", { dateStyle: "medium" }).format(new Date(s));
-  } catch {
-    return s;
-  }
-}
-
-// ---------- App state ----------
+// --------- App State ----------
 const state = {
+  user: null,
   session: null,
-  profile: null,
-  orgs: [],
-  activeOrgId: null,
+  org: null,          // active org row
+  orgs: [],           // list of orgs current user is member of
+  properties: [],
+  permits: [],
+  reports: [],
+  route: "#/login"
 };
 
-// ---------- Data layer ----------
-async function getProfile() {
-  const { data, error } = await supabase.from("profiles").select("*").eq("id", state.session.user.id).maybeSingle();
-  if (error) throw error;
-  return data;
-}
+// --------- Schema expectations (from 001_init.sql) ----------
+// public.orgs(id, name, created_at, owner_id)
+// public.org_members(org_id, user_id, role, created_at)
+// public.properties(id, org_id, name, street, zip, city, created_at)
+// public.permits(id, org_id, property_id, plate, visitor_name, valid_from, valid_to, note, created_at)
+// public.reports(id, org_id, property_id, plate, notes, occurred_at, lat, lng, created_at)
+// public.report_photos(id, report_id, org_id, storage_path, created_at)
 
-async function getOrgs() {
-  const { data, error } = await supabase
-    .from("org_members")
-    .select("org_id, role, organizations:org_id(id,name)")
-    .order("created_at", { ascending: true });
-  if (error) throw error;
-  const orgs = (data || [])
-    .map((r) => ({ id: r.organizations?.id, name: r.organizations?.name, role: r.role }))
-    .filter((o) => o.id);
-  return orgs;
-}
-
-async function ensureActiveOrg() {
-  if (!state.orgs.length) {
-    state.activeOrgId = null;
-    return;
-  }
-  const stored = localStorage.getItem("pp_active_org");
-  const found = stored && state.orgs.find((o) => o.id === stored);
-  state.activeOrgId = found ? found.id : state.orgs[0].id;
-  localStorage.setItem("pp_active_org", state.activeOrgId);
-}
-
-async function loadContext() {
-  if (!state.session) return;
-  state.profile = await getProfile().catch(() => null);
-  state.orgs = await getOrgs().catch(() => []);
-  await ensureActiveOrg();
-}
-
-function requireAuth() {
-  if (!state.session) {
+// --------- UI Shell ----------
+function renderShell(inner) {
+  const app = $("#app");
+  app.innerHTML = `
+    <div class="topbar">
+      <div class="brand">
+        <div class="logo">PP</div>
+        <div>
+          <h1>${escapeHtml(APP_NAME || "ParkPatrol")}</h1>
+          <div class="chip">${state.user ? escapeHtml(state.user.email) : "Nicht angemeldet"}</div>
+        </div>
+      </div>
+      <div class="row" style="flex:0;gap:10px;align-items:center">
+        ${state.org ? `<div class="chip">Mandat: <b style="color:var(--text)">${escapeHtml(state.org.name)}</b></div>` : ""}
+        ${state.user ? `<button class="btn ghost" id="btnLogout">Logout</button>` : ""}
+      </div>
+    </div>
+    ${inner}
+    ${state.user ? renderNavbar() : ""}
+    <div class="footerSpace"></div>
+  `;
+  const btn = $("#btnLogout");
+  if (btn) btn.addEventListener("click", async () => {
+    await supabase.auth.signOut();
+    toast("Abgemeldet", "ok");
     location.hash = "#/login";
-    return false;
-  }
-  return true;
+  });
 }
 
-// ---------- Router ----------
-const routesPublic = new Set(["#/login", "#/register"]);
-function route() {
-  const h = location.hash || "#/";
-  return h;
+function renderNavbar() {
+  const r = state.route;
+  const tab = (href, label, icon) => `
+    <div class="tab ${r.startsWith(href) ? "active" : ""}" data-href="${href}">
+      <span style="opacity:.9">${icon}</span>
+      <span>${label}</span>
+    </div>`;
+  // icons are simple unicode (safe)
+  return `
+    <div class="navbar" id="navbar">
+      ${tab("#/dashboard","Home","⌂")}
+      ${tab("#/permits","Besucher","🅿")}
+      ${tab("#/reports","Verstoss","⚑")}
+      ${tab("#/settings","Einstellungen","⚙")}
+    </div>
+  `;
 }
 
-window.addEventListener("hashchange", render);
+function wireNavbar() {
+  const nav = $("#navbar");
+  if (!nav) return;
+  nav.addEventListener("click", (e) => {
+    const t = e.target.closest(".tab");
+    if (!t) return;
+    location.hash = t.getAttribute("data-href");
+  });
+}
 
-async function bootAuth() {
-  // 1) Restore existing session (no reload hacks)
+// --------- Routing ----------
+window.addEventListener("hashchange", () => {
+  state.route = location.hash || "#/login";
+  void router();
+});
+
+async function router() {
+  state.route = location.hash || "#/login";
+
+  // Always get session fresh (handles reloads)
   const { data: { session } } = await supabase.auth.getSession();
   state.session = session;
+  state.user = session?.user ?? null;
 
-  // 2) Keep in sync
-  supabase.auth.onAuthStateChange(async (_event, session) => {
-    state.session = session;
-    await loadContext().catch(() => {});
-    // Reroute cleanly
-    const h = route();
-    if (!session && !routesPublic.has(h)) location.hash = "#/login";
-    if (session && routesPublic.has(h)) location.hash = "#/";
-    render();
+  // Gate: not logged in
+  if (!state.user && !state.route.startsWith("#/login") && !state.route.startsWith("#/register")) {
+    location.hash = "#/login";
+    return;
+  }
+  // Gate: logged in but on auth pages
+  if (state.user && (state.route.startsWith("#/login") || state.route.startsWith("#/register"))) {
+    location.hash = "#/dashboard";
+    return;
+  }
+
+  // Load org context when logged in
+  if (state.user) {
+    await loadOrgContext();
+  }
+
+  if (state.route.startsWith("#/login")) return renderLogin();
+  if (state.route.startsWith("#/register")) return renderRegister();
+  if (state.route.startsWith("#/onboarding")) return renderOnboarding();
+  if (state.route.startsWith("#/dashboard")) return renderDashboard();
+  if (state.route.startsWith("#/properties")) return renderProperties();
+  if (state.route.startsWith("#/permits")) return renderPermits();
+  if (state.route.startsWith("#/reports")) return renderReports();
+  if (state.route.startsWith("#/settings")) return renderSettings();
+
+  // default
+  location.hash = state.user ? "#/dashboard" : "#/login";
+}
+
+// Keep live auth state
+supabase.auth.onAuthStateChange((_event, session) => {
+  state.session = session;
+  state.user = session?.user ?? null;
+});
+
+// --------- Data Loading ----------
+async function loadOrgContext() {
+  // Load orgs user belongs to
+  const { data: memberships, error } = await supabase
+    .from("org_members")
+    .select("role, org:orgs(id,name,created_at)")
+    .order("created_at", { ascending: true });
+
+  if (error) {
+    console.warn(error);
+    toast("Konnte Mandate nicht laden (RLS/SQL prüfen).", "err");
+    return;
+  }
+  state.orgs = (memberships || []).map((m) => ({ ...m.org, role: m.role })).filter(Boolean);
+
+  // Choose active org (persist in localStorage)
+  const preferred = localStorage.getItem("pp_active_org");
+  let active = state.orgs.find((o) => o.id === preferred) || state.orgs[0] || null;
+  state.org = active;
+
+  if (!state.org) {
+    // no org yet → onboarding
+    if (!location.hash.startsWith("#/onboarding")) location.hash = "#/onboarding";
+    return;
+  }
+  localStorage.setItem("pp_active_org", state.org.id);
+}
+
+// --------- Auth Views ----------
+function authLayout(title, body) {
+  renderShell(`
+    <div class="grid cols-2">
+      <div class="card">
+        <h2>${escapeHtml(title)}</h2>
+        <p style="margin-bottom:12px">Voll digital. Mandantenfähig. Smart.</p>
+        ${body}
+      </div>
+      <div class="card">
+        <h2>Warum ParkPatrol?</h2>
+        <div class="kpis">
+          <div class="kpi"><div class="num">⚡</div><div class="lbl">Schneller Workflow</div></div>
+          <div class="kpi"><div class="num">🔒</div><div class="lbl">RLS / Mandantenschutz</div></div>
+          <div class="kpi"><div class="num">📸</div><div class="lbl">Foto + Geo + Dossier</div></div>
+        </div>
+        <hr class="sep"/>
+        <div class="notice">Tipp: Nach E‑Mail‑Bestätigung einfach wieder einloggen. Du bleibst danach auch beim Reload angemeldet.</div>
+      </div>
+    </div>
+  `);
+}
+
+function renderLogin() {
+  authLayout("Login", `
+    <div class="label">E‑Mail</div>
+    <input class="input" id="email" placeholder="name@domain.ch" autocomplete="email"/>
+    <div class="label">Passwort</div>
+    <input class="input" id="password" type="password" placeholder="••••••••" autocomplete="current-password"/>
+    <div style="display:flex;gap:10px;margin-top:14px;flex-wrap:wrap">
+      <button class="btn primary" id="btnLogin">Einloggen</button>
+      <button class="btn" id="btnGoRegister">Registrieren</button>
+      <button class="btn ghost" id="btnForgot">Passwort vergessen</button>
+    </div>
+    <div id="msg" style="margin-top:12px"></div>
+  `);
+
+  $("#btnGoRegister").addEventListener("click", () => location.hash = "#/register");
+  $("#btnForgot").addEventListener("click", async () => {
+    const email = $("#email").value.trim();
+    if (!email) return toast("Bitte E‑Mail eingeben.", "err");
+    const { error } = await supabase.auth.resetPasswordForEmail(email, {
+      redirectTo: location.origin + location.pathname + "#/login"
+    });
+    if (error) return toast(error.message, "err");
+    toast("Reset-Link wurde gesendet.", "ok");
   });
 
-  if (state.session) await loadContext().catch(() => {});
+  $("#btnLogin").addEventListener("click", async () => {
+    const email = $("#email").value.trim();
+    const password = $("#password").value;
+    if (!email || !password) return toast("Bitte E‑Mail + Passwort eingeben.", "err");
+
+    const { data, error } = await supabase.auth.signInWithPassword({ email, password });
+    if (error) return toast(error.message, "err");
+
+    state.user = data.user;
+    toast("Willkommen zurück!", "ok");
+    location.hash = "#/dashboard";
+  });
 }
 
-async function start() {
-  await bootAuth();
+function renderRegister() {
+  authLayout("Registrieren", `
+    <div class="label">E‑Mail</div>
+    <input class="input" id="email" placeholder="name@domain.ch" autocomplete="email"/>
+    <div class="label">Passwort</div>
+    <input class="input" id="password" type="password" placeholder="Mind. 8 Zeichen" autocomplete="new-password"/>
+    <div class="label">Passwort bestätigen</div>
+    <input class="input" id="password2" type="password" placeholder="Wiederholen" autocomplete="new-password"/>
+    <div style="display:flex;gap:10px;margin-top:14px;flex-wrap:wrap">
+      <button class="btn primary" id="btnRegister">Account erstellen</button>
+      <button class="btn" id="btnGoLogin">Zum Login</button>
+    </div>
+    <div class="notice" style="margin-top:12px">
+      Du bekommst eine E‑Mail zur Bestätigung. Danach kannst du dich anmelden.
+    </div>
+  `);
 
-  // Default route
-  if (!location.hash) location.hash = "#/";
-  render();
-}
-start();
+  $("#btnGoLogin").addEventListener("click", () => location.hash = "#/login");
+  $("#btnRegister").addEventListener("click", async () => {
+    const email = $("#email").value.trim();
+    const p1 = $("#password").value;
+    const p2 = $("#password2").value;
+    if (!email || !p1) return toast("Bitte E‑Mail + Passwort eingeben.", "err");
+    if (p1.length < 8) return toast("Passwort zu kurz (min. 8).", "err");
+    if (p1 !== p2) return toast("Passwörter stimmen nicht überein.", "err");
 
-// ---------- Layout ----------
-function Topbar() {
-  const orgName = state.activeOrgId ? (state.orgs.find(o => o.id === state.activeOrgId)?.name || "Organisation") : "Keine Organisation";
-  const orgLine = state.session ? orgName : "Anmelden";
-
-  const left = el("div", { class: "brand" }, [
-    el("div", { class: "logo", html: `<span style="font-weight:900">P</span>` }),
-    el("div", { class: "t" }, [
-      el("div", { class: "name", html: APP_NAME || "ParkPatrol" }),
-      el("div", { class: "org", html: orgLine })
-    ])
-  ]);
-
-  const right = state.session
-    ? el("button", { class: "pill", onClick: () => openOrgSheet() }, [
-        el("span", { html: "Mandat" }),
-        el("small", { html: state.orgs.length ? `${state.orgs.length}` : "0" }),
-        el("span", { html: icon("chevron") })
-      ])
-    : el("div");
-
-  return el("div", { class: "topbar" }, [
-    el("div", { class: "container row", style: "justify-content:space-between" }, [
-      left, right
-    ])
-  ]);
+    const redirectTo = location.origin + location.pathname + "#/login";
+    const { error } = await supabase.auth.signUp({ email, password: p1, options: { emailRedirectTo: redirectTo } });
+    if (error) return toast(error.message, "err");
+    toast("Check deine E‑Mail zur Bestätigung.", "ok");
+  });
 }
 
-function BottomNav(active) {
-  if (!state.session) return el("div");
-  const items = [
-    ["#/","Übersicht","home"],
-    ["#/properties","Liegenschaften","prop"],
-    ["#/permits","Besucher","permit"],
-    ["#/reports","Verstösse","report"],
-    ["#/settings","Settings","gear"],
-  ];
+// --------- Onboarding ----------
+function renderOnboarding() {
+  renderShell(`
+    <div class="card">
+      <h2>Mandat einrichten</h2>
+      <p>Du hast noch kein Mandat. Lege jetzt deine Organisation an.</p>
+      <div class="label">Name des Mandats</div>
+      <input class="input" id="orgName" placeholder="z.B. Verwaltung Muster AG"/>
+      <hr class="sep"/>
+      <div class="label">Optional: erste Liegenschaft</div>
+      <div class="row">
+        <input class="input" id="propName" placeholder="Name (z.B. Erligasse 1)"/>
+        <input class="input" id="propZip" placeholder="PLZ"/>
+      </div>
+      <div class="row" style="margin-top:10px">
+        <input class="input" id="propStreet" placeholder="Strasse"/>
+        <input class="input" id="propCity" placeholder="Ort"/>
+      </div>
+      <div style="display:flex;gap:10px;margin-top:14px;flex-wrap:wrap">
+        <button class="btn primary" id="btnCreateOrg">Mandat erstellen</button>
+        <button class="btn" id="btnReloadOrgs">Aktualisieren</button>
+      </div>
+      <div class="notice" style="margin-top:12px">Du kannst später weitere Liegenschaften und Team-Mitglieder hinzufügen.</div>
+    </div>
+  `);
 
-  const inner = el("div", { class: "inner" });
-  for (const [href, label, ico] of items) {
-    inner.append(
-      el("button", {
-        class: "navbtn" + (active === href ? " active" : ""),
-        onClick: () => (location.hash = href)
-      }, [
-        el("div", { html: icon(ico) }),
-        el("div", { html: label })
-      ])
-    );
-  }
-  return el("div", { class: "bottomnav" }, [inner]);
-}
+  wireNavbar();
 
-function PageShell(active, contentNode) {
-  appRoot.innerHTML = "";
-  appRoot.append(Topbar());
-  appRoot.append(el("div", { class: "main" }, [el("div", { class: "container" }, [contentNode])]));
-  appRoot.append(BottomNav(active));
-}
+  $("#btnReloadOrgs").addEventListener("click", async () => {
+    await loadOrgContext();
+    if (state.org) location.hash = "#/dashboard";
+  });
 
-function CenterCard(title, bodyNode) {
-  return el("div", { class: "card", style: "max-width:520px;margin:36px auto" }, [
-    el("div", { class: "hd" }, [
-      el("h2", { html: title }),
-      el("span", { class: "badge", html: "PWA" })
-    ]),
-    el("div", { class: "bd" }, [bodyNode])
-  ]);
-}
+  $("#btnCreateOrg").addEventListener("click", async () => {
+    const name = $("#orgName").value.trim();
+    if (!name) return toast("Bitte Mandats-Name eingeben.", "err");
 
-// ---------- Org sheet (switcher) ----------
-let orgSheetEl = null;
-function openOrgSheet() {
-  if (!orgSheetEl) orgSheetEl = OrgSheet();
-  orgSheetEl.classList.add("open");
-}
-function closeOrgSheet() {
-  orgSheetEl?.classList.remove("open");
-}
-function OrgSheet() {
-  const modal = el("div", { class: "modal", onClick: (e) => { if (e.target === modal) closeOrgSheet(); } });
-  const sheet = el("div", { class: "sheet" });
+    // Create org (owner_id is current user)
+    const { data: org, error: e1 } = await supabase
+      .from("orgs")
+      .insert({ name })
+      .select("*")
+      .single();
+    if (e1) return toast(e1.message, "err");
 
-  const list = el("div", { class: "list" });
-  const refresh = () => {
-    list.innerHTML = "";
-    for (const o of state.orgs) {
-      const active = o.id === state.activeOrgId;
-      list.append(
-        el("div", { class: "item", style: active ? "border-color:rgba(110,145,255,.45);background:rgba(110,145,255,.10)" : "" }, [
-          el("div", {}, [
-            el("div", { class: "title", html: o.name }),
-            el("div", { class: "sub", html: `Rolle: ${o.role}` })
-          ]),
-          el("button", { class: "btn", onClick: () => {
-            state.activeOrgId = o.id;
-            localStorage.setItem("pp_active_org", o.id);
-            closeOrgSheet();
-            render();
-          } }, [el("span", { html: active ? "Aktiv" : "Wechseln" })])
-        ])
-      );
+    // Create membership (role = owner)
+    const { error: e2 } = await supabase.from("org_members").insert({ org_id: org.id, role: "owner" });
+    if (e2) return toast(e2.message, "err");
+
+    // Optional property
+    const propName = $("#propName").value.trim();
+    if (propName) {
+      const payload = {
+        org_id: org.id,
+        name: propName,
+        street: $("#propStreet").value.trim(),
+        zip: $("#propZip").value.trim(),
+        city: $("#propCity").value.trim()
+      };
+      const { error: e3 } = await supabase.from("properties").insert(payload);
+      if (e3) toast("Mandat erstellt, aber Liegenschaft nicht gespeichert: " + e3.message, "err");
     }
-    if (!state.orgs.length) {
-      list.append(el("div", { class: "muted small", html: "Noch kein Mandat. Erstelle eines im Onboarding." }));
-    }
-  };
 
-  const head = el("div", { class: "row spread" }, [
-    el("div", { class: "title", html: "Mandate" }),
-    el("button", { class: "btn", onClick: closeOrgSheet }, [el("span", { html: "Schliessen" })])
-  ]);
-
-  const actions = el("div", { class: "actions" }, [
-    el("button", { class: "btn primary", onClick: () => { closeOrgSheet(); location.hash = "#/onboarding"; } }, [
-      el("span", { html: icon("plus") }), el("span", { html: "Neues Mandat" })
-    ])
-  ]);
-
-  sheet.append(head, el("div", { class: "sep" }), list, el("div", { class: "sep" }), actions);
-  modal.append(sheet);
-  document.body.append(modal);
-  refresh();
-
-  // update when reopened
-  modal.addEventListener("transitionstart", refresh);
-  return modal;
+    localStorage.setItem("pp_active_org", org.id);
+    toast("Mandat erstellt!", "ok");
+    await loadOrgContext();
+    location.hash = "#/dashboard";
+  });
 }
 
-// ---------- Pages ----------
-function LoginPage() {
-  const email = el("input", { class: "input", type: "email", placeholder: "E-Mail", autocomplete: "email" });
-  const pass = el("input", { class: "input", type: "password", placeholder: "Passwort", autocomplete: "current-password" });
+// --------- Dashboard ----------
+async function renderDashboard() {
+  // load KPIs
+  const orgId = state.org?.id;
+  if (!orgId) return renderOnboarding();
 
-  const btn = el("button", { class: "btn primary", onClick: async () => {
-    btn.disabled = true;
-    try {
-      const { error } = await supabase.auth.signInWithPassword({ email: email.value.trim(), password: pass.value });
-      if (error) throw error;
-      showToast("Eingeloggt.");
-      location.hash = "#/";
-    } catch (e) {
-      showToast(e.message || "Login fehlgeschlagen");
-    } finally {
-      btn.disabled = false;
-    }
-  } }, [el("span", { html: "Login" })]);
-
-  const body = el("div", {}, [
-    el("div", { class: "field" }, [el("div", { class: "label", html: "E-Mail" }), email]),
-    el("div", { class: "field" }, [el("div", { class: "label", html: "Passwort" }), pass]),
-    el("div", { class: "row spread" }, [
-      btn,
-      el("button", { class: "btn", onClick: () => location.hash = "#/register" }, [el("span", { html: "Registrieren" })])
-    ]),
-    el("div", { class: "sep" }),
-    el("div", { class: "muted small", html: "Hinweis: Nach Registrierung kann eine E-Mail-Bestätigung nötig sein (je nach Supabase-Einstellung)." })
+  const [propsRes, permitsRes, reportsRes] = await Promise.all([
+    supabase.from("properties").select("id").eq("org_id", orgId),
+    supabase.from("permits").select("id").eq("org_id", orgId),
+    supabase.from("reports").select("id").eq("org_id", orgId)
   ]);
-  return CenterCard("Anmelden", body);
+
+  const props = propsRes.data?.length ?? 0;
+  const permits = permitsRes.data?.length ?? 0;
+  const reports = reportsRes.data?.length ?? 0;
+
+  renderShell(`
+    <div class="grid cols-2">
+      <div class="card">
+        <h2>Übersicht</h2>
+        <div class="kpis">
+          <div class="kpi"><div class="num">${props}</div><div class="lbl">Liegenschaften</div></div>
+          <div class="kpi"><div class="num">${permits}</div><div class="lbl">Besucherbewilligungen</div></div>
+          <div class="kpi"><div class="num">${reports}</div><div class="lbl">Verstossberichte</div></div>
+        </div>
+        <hr class="sep"/>
+        <div style="display:flex;gap:10px;flex-wrap:wrap">
+          <button class="btn" id="goProps">Liegenschaften verwalten</button>
+          <button class="btn" id="goPermits">Besucher hinzufügen</button>
+          <button class="btn primary" id="goReport">Verstoss melden</button>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>Mandat wechseln</h2>
+        <p>Du kannst mehrere Mandate führen (für verschiedene Kunden/Verwaltungen).</p>
+        <div class="label">Aktives Mandat</div>
+        <select class="input" id="orgSelect">
+          ${state.orgs.map(o => `<option value="${o.id}" ${o.id===orgId?"selected":""}>${escapeHtml(o.name)} (${escapeHtml(o.role)})</option>`).join("")}
+        </select>
+        <div style="display:flex;gap:10px;margin-top:12px;flex-wrap:wrap">
+          <button class="btn" id="btnNewOrg">Neues Mandat</button>
+          <button class="btn" id="btnGoProps2">Liegenschaften</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="grid cols-2" style="margin-top:14px">
+      <div class="card">
+        <h2>Quick Actions</h2>
+        <div class="list">
+          <div class="item">
+            <div>
+              <div><b>Besucherprüfung</b></div>
+              <div class="meta">Kennzeichen eingeben → gültige Bewilligung?</div>
+            </div>
+            <button class="btn" id="btnCheckPermit">Prüfen</button>
+          </div>
+          <div class="item">
+            <div>
+              <div><b>Neuer Bericht</b></div>
+              <div class="meta">Foto + Notizen + Ort (optional)</div>
+            </div>
+            <button class="btn primary" id="btnNewReport">Erstellen</button>
+          </div>
+        </div>
+      </div>
+      <div class="card">
+        <h2>Status</h2>
+        <div class="notice ok">Auth: Session persistiert. Reload bleibt eingeloggt.</div>
+        <div class="notice" style="margin-top:10px">PWA Updates: Keine Ctrl+F5 nötig. (Network-first no-store)</div>
+      </div>
+    </div>
+  `);
+
+  wireNavbar();
+
+  $("#orgSelect").addEventListener("change", async (e) => {
+    const id = e.target.value;
+    localStorage.setItem("pp_active_org", id);
+    await loadOrgContext();
+    toast("Mandat gewechselt", "ok");
+    location.hash = "#/dashboard";
+  });
+
+  $("#btnNewOrg").addEventListener("click", () => location.hash = "#/onboarding");
+  $("#btnGoProps2").addEventListener("click", () => location.hash = "#/properties");
+  $("#goProps").addEventListener("click", () => location.hash = "#/properties");
+  $("#goPermits").addEventListener("click", () => location.hash = "#/permits");
+  $("#goReport").addEventListener("click", () => location.hash = "#/reports?new=1");
+  $("#btnNewReport").addEventListener("click", () => location.hash = "#/reports?new=1");
+
+  $("#btnCheckPermit").addEventListener("click", async () => {
+    const plate = prompt("Kennzeichen eingeben (z.B. ZH123456):");
+    if (!plate) return;
+    const normalized = plate.replace(/\s+/g,"").toUpperCase();
+    const nowIso = new Date().toISOString();
+    const { data, error } = await supabase
+      .from("permits")
+      .select("id, plate, visitor_name, valid_from, valid_to, property:properties(name)")
+      .eq("org_id", orgId)
+      .eq("plate", normalized)
+      .lte("valid_from", nowIso)
+      .gte("valid_to", nowIso)
+      .limit(5);
+    if (error) return toast(error.message, "err");
+    if (!data?.length) return toast("Keine gültige Bewilligung gefunden.", "err");
+    const p = data[0];
+    toast(`Gültig: ${p.plate} (${p.visitor_name||"Besucher"}) @ ${p.property?.name||"-"}`, "ok");
+  });
 }
 
-function RegisterPage() {
-  const email = el("input", { class: "input", type: "email", placeholder: "E-Mail", autocomplete: "email" });
-  const pass = el("input", { class: "input", type: "password", placeholder: "Passwort (min. 8 Zeichen)", autocomplete: "new-password" });
-
-  const btn = el("button", { class: "btn primary", onClick: async () => {
-    btn.disabled = true;
-    try {
-      const { data, error } = await supabase.auth.signUp({
-        email: email.value.trim(),
-        password: pass.value,
-        options: {
-          emailRedirectTo: location.origin + location.pathname + "#/"
-        }
-      });
-      if (error) throw error;
-
-      if (data?.user && !data?.session) {
-        showToast("Registriert. Bitte E-Mail bestätigen und dann einloggen.");
-        location.hash = "#/login";
-      } else {
-        showToast("Registriert & eingeloggt.");
-        location.hash = "#/onboarding";
-      }
-    } catch (e) {
-      showToast(e.message || "Registrierung fehlgeschlagen");
-    } finally {
-      btn.disabled = false;
-    }
-  } }, [el("span", { html: "Konto erstellen" })]);
-
-  const body = el("div", {}, [
-    el("div", { class: "field" }, [el("div", { class: "label", html: "E-Mail" }), email]),
-    el("div", { class: "field" }, [el("div", { class: "label", html: "Passwort" }), pass]),
-    el("div", { class: "row spread" }, [
-      btn,
-      el("button", { class: "btn", onClick: () => location.hash = "#/login" }, [el("span", { html: "Zurück" })])
-    ])
-  ]);
-
-  return CenterCard("Registrieren", body);
-}
-
-function OnboardingPage() {
-  if (!requireAuth()) return CenterCard("Weiterleitung…", el("div"));
-  const orgName = el("input", { class: "input", placeholder: "z.B. Muster Verwaltung AG" });
-  const propName = el("input", { class: "input", placeholder: "z.B. Liegenschaft Bahnhofstrasse 1" });
-  const propAddr = el("input", { class: "input", placeholder: "Adresse (optional)" });
-
-  const btn = el("button", { class: "btn primary", onClick: async () => {
-    btn.disabled = true;
-    try {
-      const name = orgName.value.trim();
-      if (!name) throw new Error("Bitte Mandatsname angeben.");
-
-      // Create org; trigger creates owner membership
-      const { data: org, error: e1 } = await supabase
-        .from("organizations")
-        .insert({ name, created_by: state.session.user.id })
-        .select("id,name")
-        .single();
-      if (e1) throw e1;
-
-      // Optional property
-      if (propName.value.trim()) {
-        const { error: e2 } = await supabase.from("properties").insert({
-          org_id: org.id,
-          name: propName.value.trim(),
-          address: propAddr.value.trim() || null
-        });
-        if (e2) throw e2;
-      }
-
-      showToast("Mandat erstellt.");
-      await loadContext();
-      location.hash = "#/";
-    } catch (e) {
-      showToast(e.message || "Onboarding fehlgeschlagen");
-    } finally {
-      btn.disabled = false;
-    }
-  } }, [el("span", { html: "Mandat erstellen" })]);
-
-  const body = el("div", {}, [
-    el("div", { class: "muted small", html: "Erstelle dein erstes Mandat. Danach kannst du Liegenschaften, Besucherbewilligungen und Verstösse verwalten." }),
-    el("div", { class: "sep" }),
-    el("div", { class: "field" }, [el("div", { class: "label", html: "Mandat / Organisation" }), orgName]),
-    el("div", { class: "two" }, [
-      el("div", { class: "field" }, [el("div", { class: "label", html: "Erste Liegenschaft (optional)" }), propName]),
-      el("div", { class: "field" }, [el("div", { class: "label", html: "Adresse (optional)" }), propAddr]),
-    ]),
-    el("div", { class: "row spread" }, [
-      btn,
-      el("button", { class: "btn", onClick: () => location.hash = "#/" }, [el("span", { html: "Überspringen" })])
-    ])
-  ]);
-
-  return CenterCard("Onboarding", body);
-}
-
-async function DashboardPage() {
-  if (!requireAuth()) return CenterCard("Weiterleitung…", el("div"));
-
-  if (!state.orgs.length) return OnboardingPage();
-
-  const org_id = state.activeOrgId;
-
-  const [props, permits, reports] = await Promise.all([
-    supabase.from("properties").select("id", { count: "exact", head: true }).eq("org_id", org_id),
-    supabase.from("visitor_permits").select("id", { count: "exact", head: true }).eq("org_id", org_id),
-    supabase.from("reports").select("id", { count: "exact", head: true }).eq("org_id", org_id),
-  ]);
-
-  const k1 = props.count ?? 0;
-  const k2 = permits.count ?? 0;
-  const k3 = reports.count ?? 0;
-
-  const kpis = el("div", { class: "kpis" }, [
-    el("div", { class: "kpi" }, [el("div", { class: "v", html: String(k1) }), el("div", { class: "l", html: "Liegenschaften" })]),
-    el("div", { class: "kpi" }, [el("div", { class: "v", html: String(k2) }), el("div", { class: "l", html: "Besucherbewilligungen" })]),
-    el("div", { class: "kpi" }, [el("div", { class: "v", html: String(k3) }), el("div", { class: "l", html: "Verstösse (Reports)" })]),
-    el("div", { class: "kpi" }, [el("div", { class: "v", html: "∞" }), el("div", { class: "l", html: "Digitaler Vorsprung" })]),
-  ]);
-
-  const quick = el("div", { class: "row wrap" }, [
-    el("button", { class: "btn primary", onClick: () => location.hash = "#/reports?new=1" }, [el("span", { html: icon("plus") }), el("span", { html: "Neuer Verstoss" })]),
-    el("button", { class: "btn", onClick: () => location.hash = "#/permits?new=1" }, [el("span", { html: icon("plus") }), el("span", { html: "Neue Besucherbewilligung" })]),
-    el("button", { class: "btn", onClick: () => location.hash = "#/properties?new=1" }, [el("span", { html: icon("plus") }), el("span", { html: "Neue Liegenschaft" })]),
-  ]);
-
-  const panel = el("div", { class: "card" }, [
-    el("div", { class: "hd" }, [el("h2", { html: "Übersicht" })]),
-    el("div", { class: "bd" }, [kpis, el("div", { class: "sep" }), quick])
-  ]);
-
-  return panel;
-}
-
-function parseQuery() {
-  const h = location.hash || "#/";
-  const i = h.indexOf("?");
-  if (i === -1) return {};
-  const q = h.slice(i + 1);
-  const params = new URLSearchParams(q);
-  const obj = {};
-  for (const [k, v] of params.entries()) obj[k] = v;
-  return obj;
-}
-
-async function PropertiesPage() {
-  if (!requireAuth()) return CenterCard("Weiterleitung…", el("div"));
-  if (!state.orgs.length) return OnboardingPage();
-
-  const org_id = state.activeOrgId;
-
-  const { data, error } = await supabase.from("properties").select("*").eq("org_id", org_id).order("created_at", { ascending: false });
-  if (error) return CenterCard("Fehler", el("div", { html: error.message }));
-
-  const list = el("div", { class: "list" });
-  for (const p of data || []) {
-    list.append(
-      el("div", { class: "item" }, [
-        el("div", {}, [
-          el("div", { class: "title", html: p.name }),
-          el("div", { class: "sub", html: p.address || "—" })
-        ]),
-        el("div", { class: "row" }, [
-          el("button", { class: "btn", onClick: () => openPropertyModal(p) }, [el("span", { html: "Bearbeiten" })]),
-          el("button", { class: "btn danger", onClick: async () => {
-            if (!confirm("Liegenschaft löschen?")) return;
-            const { error: e2 } = await supabase.from("properties").delete().eq("id", p.id);
-            if (e2) showToast(e2.message);
-            else { showToast("Gelöscht."); render(); }
-          } }, [el("span", { html: "Löschen" })])
-        ])
-      ])
-    );
-  }
-
-  const addBtn = el("button", { class: "btn primary", onClick: () => openPropertyModal(null) }, [
-    el("span", { html: icon("plus") }), el("span", { html: "Liegenschaft hinzufügen" })
-  ]);
-
-  const card = el("div", { class: "card" }, [
-    el("div", { class: "hd" }, [
-      el("h2", { html: "Liegenschaften" }),
-      addBtn
-    ]),
-    el("div", { class: "bd" }, [
-      data?.length ? list : el("div", { class: "muted", html: "Noch keine Liegenschaften." })
-    ])
-  ]);
-
-  // Auto-open via query
-  const q = parseQuery();
-  if (q.new === "1") setTimeout(() => openPropertyModal(null), 50);
-
-  return card;
-
-  function openPropertyModal(prop) {
-    const modal = el("div", { class: "modal open", onClick: (e) => { if (e.target === modal) close(); } });
-    const name = el("input", { class: "input", placeholder: "Name", value: prop?.name || "" });
-    const addr = el("input", { class: "input", placeholder: "Adresse", value: prop?.address || "" });
-
-    const save = el("button", { class: "btn primary", onClick: async () => {
-      save.disabled = true;
-      try {
-        if (!name.value.trim()) throw new Error("Name fehlt.");
-        if (prop) {
-          const { error: e } = await supabase.from("properties").update({ name: name.value.trim(), address: addr.value.trim() || null }).eq("id", prop.id);
-          if (e) throw e;
-          showToast("Gespeichert.");
-        } else {
-          const { error: e } = await supabase.from("properties").insert({ org_id, name: name.value.trim(), address: addr.value.trim() || null });
-          if (e) throw e;
-          showToast("Erstellt.");
-        }
-        close();
-        render();
-      } catch (e) {
-        showToast(e.message || "Speichern fehlgeschlagen");
-      } finally {
-        save.disabled = false;
-      }
-    } }, [el("span", { html: "Speichern" })]);
-
-    const sheet = el("div", { class: "sheet" }, [
-      el("div", { class: "row spread" }, [
-        el("div", { class: "title", html: prop ? "Liegenschaft bearbeiten" : "Neue Liegenschaft" }),
-        el("button", { class: "btn", onClick: close }, [el("span", { html: "Schliessen" })])
-      ]),
-      el("div", { class: "sep" }),
-      el("div", { class: "field" }, [el("div", { class: "label", html: "Name" }), name]),
-      el("div", { class: "field" }, [el("div", { class: "label", html: "Adresse" }), addr]),
-      el("div", { class: "actions" }, [save])
-    ]);
-
-    modal.append(sheet);
-    document.body.append(modal);
-    function close() { modal.remove(); }
-  }
-}
-
-async function PermitsPage() {
-  if (!requireAuth()) return CenterCard("Weiterleitung…", el("div"));
-  if (!state.orgs.length) return OnboardingPage();
-
-  const org_id = state.activeOrgId;
-  const q = parseQuery();
-
-  const search = el("input", { class: "input", placeholder: "Suchen: Kennzeichen / Name" });
+// --------- Properties ----------
+async function renderProperties() {
+  const orgId = state.org?.id;
+  if (!orgId) return renderOnboarding();
 
   const { data, error } = await supabase
-    .from("visitor_permits")
+    .from("properties")
     .select("*")
-    .eq("org_id", org_id)
-    .order("created_at", { ascending: false })
-    .limit(200);
+    .eq("org_id", orgId)
+    .order("created_at", { ascending: false });
 
-  if (error) return CenterCard("Fehler", el("div", { html: error.message }));
+  if (error) toast(error.message, "err");
+  state.properties = data || [];
 
-  const list = el("div", { class: "list" });
+  renderShell(`
+    <div class="grid cols-2">
+      <div class="card">
+        <h2>Liegenschaften</h2>
+        <p>Verwalte deine Liegenschaften (Adresse, Name, etc.).</p>
+        <hr class="sep"/>
+        <div class="label">Name</div>
+        <input class="input" id="pName" placeholder="z.B. Erligasse 1"/>
+        <div class="row">
+          <div>
+            <div class="label">Strasse</div>
+            <input class="input" id="pStreet" placeholder="Strasse + Nr."/>
+          </div>
+          <div>
+            <div class="label">PLZ</div>
+            <input class="input" id="pZip" placeholder="5106"/>
+          </div>
+        </div>
+        <div class="label">Ort</div>
+        <input class="input" id="pCity" placeholder="Veltheim"/>
+        <div style="display:flex;gap:10px;margin-top:14px;flex-wrap:wrap">
+          <button class="btn primary" id="btnAddProp">Hinzufügen</button>
+          <button class="btn" id="btnBack">Zur Übersicht</button>
+        </div>
+      </div>
 
-  function renderList(filter = "") {
-    list.innerHTML = "";
-    const f = filter.trim().toLowerCase();
-    const rows = (data || []).filter(r => {
-      if (!f) return true;
-      return (r.plate || "").toLowerCase().includes(f) || (r.visitor_name || "").toLowerCase().includes(f);
-    });
+      <div class="card">
+        <h2>Liste</h2>
+        <div class="list" id="propList">
+          ${state.properties.length ? state.properties.map(p => `
+            <div class="item">
+              <div>
+                <div><b>${escapeHtml(p.name)}</b></div>
+                <div class="meta">${escapeHtml([p.street,p.zip,p.city].filter(Boolean).join(", "))}</div>
+              </div>
+              <button class="btn danger" data-del="${p.id}">Löschen</button>
+            </div>
+          `).join("") : `<div class="notice">Noch keine Liegenschaften.</div>`}
+        </div>
+      </div>
+    </div>
+  `);
 
-    for (const r of rows) {
-      const valid = (!r.valid_to) || (new Date(r.valid_to) > new Date());
-      list.append(
-        el("div", { class: "item" }, [
-          el("div", {}, [
-            el("div", { class: "title", html: (r.plate || "—").toUpperCase() }),
-            el("div", { class: "sub", html: `${r.visitor_name || "Besucher"} • gültig bis ${r.valid_to ? fmtDate(r.valid_to) : "offen"}` })
-          ]),
-          el("div", { class: "row" }, [
-            el("span", { class: "badge", html: valid ? "Aktiv" : "Abgelaufen", style: valid ? "color:var(--good)" : "color:var(--warn)" }),
-            el("button", { class: "btn danger", onClick: async () => {
-              if (!confirm("Bewilligung widerrufen/löschen?")) return;
-              const { error: e2 } = await supabase.from("visitor_permits").delete().eq("id", r.id);
-              if (e2) showToast(e2.message);
-              else { showToast("Entfernt."); location.hash = "#/permits"; render(); }
-            } }, [el("span", { html: "Entfernen" })])
-          ])
-        ])
-      );
-    }
+  wireNavbar();
 
-    if (!rows.length) list.append(el("div", { class: "muted", html: "Keine passenden Bewilligungen." }));
-  }
+  $("#btnBack").addEventListener("click", () => location.hash = "#/dashboard");
 
-  search.addEventListener("input", () => renderList(search.value));
-  renderList("");
+  $("#btnAddProp").addEventListener("click", async () => {
+    const payload = {
+      org_id: orgId,
+      name: $("#pName").value.trim(),
+      street: $("#pStreet").value.trim(),
+      zip: $("#pZip").value.trim(),
+      city: $("#pCity").value.trim()
+    };
+    if (!payload.name) return toast("Name fehlt.", "err");
 
-  const addBtn = el("button", { class: "btn primary", onClick: () => openPermitModal(null) }, [
-    el("span", { html: icon("plus") }), el("span", { html: "Bewilligung erstellen" })
-  ]);
+    const { error } = await supabase.from("properties").insert(payload);
+    if (error) return toast(error.message, "err");
+    toast("Liegenschaft gespeichert.", "ok");
+    location.hash = "#/properties";
+  });
 
-  const card = el("div", { class: "card" }, [
-    el("div", { class: "hd" }, [el("h2", { html: "Besucherbewilligungen" }), addBtn]),
-    el("div", { class: "bd" }, [
-      el("div", { class: "field" }, [el("div", { class: "label", html: "Suche" }), search]),
-      list
-    ])
-  ]);
-
-  if (q.new === "1") setTimeout(() => openPermitModal(null), 50);
-  return card;
-
-  async function openPermitModal(row) {
-    const modal = el("div", { class: "modal open", onClick: (e) => { if (e.target === modal) close(); } });
-    const plate = el("input", { class: "input", placeholder: "Kennzeichen", value: row?.plate || "" });
-    const name = el("input", { class: "input", placeholder: "Besuchername (optional)", value: row?.visitor_name || "" });
-    const from = el("input", { class: "input", type: "datetime-local" });
-    const to = el("input", { class: "input", type: "datetime-local" });
-
-    const { data: props } = await supabase.from("properties").select("id,name").eq("org_id", org_id).order("created_at", { ascending: false });
-    const propSel = el("select", { class: "input" }, [
-      el("option", { value: "" }, [document.createTextNode("— (keine Liegenschaft) —")]),
-      ...(props || []).map(p => el("option", { value: p.id }, [document.createTextNode(p.name)]))
-    ]);
-
-    const save = el("button", { class: "btn primary", onClick: async () => {
-      save.disabled = true;
-      try {
-        if (!plate.value.trim()) throw new Error("Kennzeichen fehlt.");
-        const payload = {
-          org_id,
-          plate: plate.value.trim(),
-          visitor_name: name.value.trim() || null,
-          property_id: propSel.value || null,
-          valid_from: from.value ? new Date(from.value).toISOString() : null,
-          valid_to: to.value ? new Date(to.value).toISOString() : null
-        };
-        const { error: e } = await supabase.from("visitor_permits").insert(payload);
-        if (e) throw e;
-        showToast("Bewilligung erstellt.");
-        close(); render();
-      } catch (e) {
-        showToast(e.message || "Fehler");
-      } finally { save.disabled = false; }
-    } }, [el("span", { html: "Speichern" })]);
-
-    const sheet = el("div", { class: "sheet" }, [
-      el("div", { class: "row spread" }, [
-        el("div", { class: "title", html: "Neue Bewilligung" }),
-        el("button", { class: "btn", onClick: close }, [el("span", { html: "Schliessen" })])
-      ]),
-      el("div", { class: "sep" }),
-      el("div", { class: "two" }, [
-        el("div", { class: "field" }, [el("div", { class: "label", html: "Kennzeichen" }), plate]),
-        el("div", { class: "field" }, [el("div", { class: "label", html: "Besucher" }), name]),
-      ]),
-      el("div", { class: "two" }, [
-        el("div", { class: "field" }, [el("div", { class: "label", html: "Gültig ab" }), from]),
-        el("div", { class: "field" }, [el("div", { class: "label", html: "Gültig bis" }), to]),
-      ]),
-      el("div", { class: "field" }, [el("div", { class: "label", html: "Liegenschaft (optional)" }), propSel]),
-      el("div", { class: "actions" }, [save])
-    ]);
-
-    modal.append(sheet);
-    document.body.append(modal);
-    function close() { modal.remove(); }
-  }
+  $("#propList").addEventListener("click", async (e) => {
+    const id = e.target.closest("button")?.getAttribute("data-del");
+    if (!id) return;
+    if (!confirm("Liegenschaft wirklich löschen?")) return;
+    const { error } = await supabase.from("properties").delete().eq("id", id);
+    if (error) return toast(error.message, "err");
+    toast("Gelöscht.", "ok");
+    location.hash = "#/properties";
+  });
 }
 
-async function ReportsPage() {
-  if (!requireAuth()) return CenterCard("Weiterleitung…", el("div"));
-  if (!state.orgs.length) return OnboardingPage();
+// --------- Permits ----------
+async function renderPermits() {
+  const orgId = state.org?.id;
+  if (!orgId) return renderOnboarding();
 
-  const org_id = state.activeOrgId;
-  const q = parseQuery();
+  // load properties
+  const { data: props } = await supabase.from("properties").select("id,name").eq("org_id", orgId).order("name");
+  const propsList = props || [];
+  const propOptions = propsList.map(p => `<option value="${p.id}">${escapeHtml(p.name)}</option>`).join("");
+
+  const { data, error } = await supabase
+    .from("permits")
+    .select("*, property:properties(name)")
+    .eq("org_id", orgId)
+    .order("created_at", { ascending: false })
+    .limit(100);
+
+  if (error) toast(error.message, "err");
+  state.permits = data || [];
+
+  renderShell(`
+    <div class="grid cols-2">
+      <div class="card">
+        <h2>Besucherbewilligung</h2>
+        <p>Füge eine Bewilligung hinzu (Kennzeichen + Zeitraum).</p>
+
+        <div class="label">Liegenschaft</div>
+        <select class="input" id="permitProperty">
+          ${propOptions || `<option value="">(keine Liegenschaft vorhanden)</option>`}
+        </select>
+
+        <div class="label">Kennzeichen</div>
+        <input class="input" id="permitPlate" placeholder="ZH123456" />
+
+        <div class="row">
+          <div>
+            <div class="label">Von</div>
+            <input class="input" id="permitFrom" type="datetime-local" />
+          </div>
+          <div>
+            <div class="label">Bis</div>
+            <input class="input" id="permitTo" type="datetime-local" />
+          </div>
+        </div>
+
+        <div class="label">Besuchername (optional)</div>
+        <input class="input" id="permitVisitor" placeholder="Max Muster" />
+
+        <div class="label">Notiz (optional)</div>
+        <input class="input" id="permitNote" placeholder="z.B. Wohnung 2. OG" />
+
+        <div style="display:flex;gap:10px;margin-top:14px;flex-wrap:wrap">
+          <button class="btn primary" id="btnAddPermit">Speichern</button>
+          <button class="btn" id="btnToProps">Liegenschaften</button>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>Aktive Bewilligungen</h2>
+        <div class="list" id="permitList">
+          ${state.permits.length ? state.permits.map(p => `
+            <div class="item">
+              <div>
+                <div><b>${escapeHtml(p.plate)}</b> <span class="pill">${escapeHtml(p.property?.name||"-")}</span></div>
+                <div class="meta">${escapeHtml(p.visitor_name||"")}</div>
+                <div class="meta">${fmtDate(p.valid_from)} → ${fmtDate(p.valid_to)}</div>
+              </div>
+              <button class="btn danger" data-del="${p.id}">Löschen</button>
+            </div>
+          `).join("") : `<div class="notice">Noch keine Bewilligungen.</div>`}
+        </div>
+      </div>
+    </div>
+  `);
+
+  wireNavbar();
+
+  // set defaults
+  const now = new Date();
+  const plus2h = new Date(now.getTime() + 2*60*60*1000);
+  $("#permitFrom").value = now.toISOString().slice(0,16);
+  $("#permitTo").value = plus2h.toISOString().slice(0,16);
+
+  $("#btnToProps").addEventListener("click", () => location.hash = "#/properties");
+
+  $("#btnAddPermit").addEventListener("click", async () => {
+    const property_id = $("#permitProperty").value || null;
+    const plate = $("#permitPlate").value.trim().replace(/\s+/g,"").toUpperCase();
+    if (!plate) return toast("Kennzeichen fehlt.", "err");
+
+    const valid_from = new Date($("#permitFrom").value).toISOString();
+    const valid_to = new Date($("#permitTo").value).toISOString();
+    if (valid_to <= valid_from) return toast("Zeitraum ungültig.", "err");
+
+    const payload = {
+      org_id: orgId,
+      property_id,
+      plate,
+      valid_from,
+      valid_to,
+      visitor_name: $("#permitVisitor").value.trim() || null,
+      note: $("#permitNote").value.trim() || null
+    };
+    const { error } = await supabase.from("permits").insert(payload);
+    if (error) return toast(error.message, "err");
+    toast("Bewilligung gespeichert.", "ok");
+    location.hash = "#/permits";
+  });
+
+  $("#permitList").addEventListener("click", async (e) => {
+    const id = e.target.closest("button")?.getAttribute("data-del");
+    if (!id) return;
+    if (!confirm("Bewilligung wirklich löschen?")) return;
+    const { error } = await supabase.from("permits").delete().eq("id", id);
+    if (error) return toast(error.message, "err");
+    toast("Gelöscht.", "ok");
+    location.hash = "#/permits";
+  });
+}
+
+// --------- Reports (Violation Reports) ----------
+async function renderReports() {
+  const orgId = state.org?.id;
+  if (!orgId) return renderOnboarding();
+
+  const qs = new URLSearchParams(location.hash.split("?")[1] || "");
+  const isNew = qs.get("new") === "1";
+
+  const { data: props } = await supabase.from("properties").select("id,name").eq("org_id", orgId).order("name");
+  const propsList = props || [];
+
+  if (isNew) {
+    return renderReportCreate(propsList);
+  }
 
   const { data, error } = await supabase
     .from("reports")
-    .select("id,created_at,plate,location_text,notes,status")
-    .eq("org_id", org_id)
+    .select("*, property:properties(name), photos:report_photos(storage_path)")
+    .eq("org_id", orgId)
     .order("created_at", { ascending: false })
-    .limit(200);
+    .limit(100);
 
-  if (error) return CenterCard("Fehler", el("div", { html: error.message }));
+  if (error) toast(error.message, "err");
+  state.reports = data || [];
 
-  const list = el("div", { class: "list" });
-  for (const r of data || []) {
-    list.append(
-      el("div", { class: "item" }, [
-        el("div", {}, [
-          el("div", { class: "title", html: (r.plate || "—").toUpperCase() }),
-          el("div", { class: "sub", html: `${fmtDateTime(r.created_at)} • ${r.location_text || "—"}` }),
-          r.notes ? el("div", { class: "sub", html: r.notes }) : el("span")
-        ]),
-        el("span", { class: "badge", html: r.status || "open" })
-      ])
-    );
-  }
+  renderShell(`
+    <div class="grid cols-2">
+      <div class="card">
+        <h2>Parkverstossberichte</h2>
+        <p>Erfasse Verstösse als digitaler Report (Foto, Notiz, Ort).</p>
+        <div style="display:flex;gap:10px;margin-top:14px;flex-wrap:wrap">
+          <button class="btn primary" id="btnNew">Bericht erstellen</button>
+          <button class="btn" id="btnGoPermits">Besucher prüfen</button>
+        </div>
+        <hr class="sep"/>
+        <div class="notice">Tipp: Du kannst später PDF-Export / Dossier-Download ergänzen.</div>
+      </div>
 
-  const addBtn = el("button", { class: "btn primary", onClick: () => openReportModal() }, [
-    el("span", { html: icon("plus") }), el("span", { html: "Neuer Verstoss" })
-  ]);
+      <div class="card">
+        <h2>Letzte Berichte</h2>
+        <div class="list" id="reportList">
+          ${state.reports.length ? state.reports.map(r => `
+            <div class="item">
+              <div>
+                <div><b>${escapeHtml(r.plate || "(kein Kennzeichen)")}</b> <span class="pill">${escapeHtml(r.property?.name||"-")}</span></div>
+                <div class="meta">${fmtDate(r.occurred_at || r.created_at)}</div>
+                <div class="meta">${escapeHtml((r.notes||"").slice(0,120))}</div>
+              </div>
+              <button class="btn" data-view="${r.id}">Öffnen</button>
+            </div>
+          `).join("") : `<div class="notice">Noch keine Berichte.</div>`}
+        </div>
+      </div>
+    </div>
+  `);
 
-  const card = el("div", { class: "card" }, [
-    el("div", { class: "hd" }, [el("h2", { html: "Verstösse" }), addBtn]),
-    el("div", { class: "bd" }, [
-      data?.length ? list : el("div", { class: "muted", html: "Noch keine Reports." })
-    ])
-  ]);
+  wireNavbar();
 
-  if (q.new === "1") setTimeout(openReportModal, 50);
-  return card;
+  $("#btnNew").addEventListener("click", () => location.hash = "#/reports?new=1");
+  $("#btnGoPermits").addEventListener("click", () => location.hash = "#/permits");
 
-  async function openReportModal() {
-    const modal = el("div", { class: "modal open", onClick: (e) => { if (e.target === modal) close(); } });
-
-    const plate = el("input", { class: "input", placeholder: "Kennzeichen" });
-    const locationText = el("input", { class: "input", placeholder: "Ort / Parkplatz / Bemerkung" });
-    const notes = el("textarea", { class: "input", placeholder: "Notizen (optional)", rows: "3" });
-
-    const photoInput = el("input", { class: "input", type: "file", accept: "image/*", capture: "environment" });
-    const geoBtn = el("button", { class: "btn", onClick: async () => {
-      geoBtn.disabled = true;
-      try {
-        const pos = await new Promise((resolve, reject) => {
-          navigator.geolocation.getCurrentPosition(resolve, reject, { enableHighAccuracy: true, timeout: 8000 });
-        });
-        modal._geo = { lat: pos.coords.latitude, lng: pos.coords.longitude, accuracy_m: pos.coords.accuracy };
-        showToast("Position erfasst.");
-      } catch (e) {
-        showToast("Position nicht verfügbar.");
-      } finally { geoBtn.disabled = false; }
-    } }, [el("span", { html: "Position erfassen" })]);
-
-    // Optional property selector
-    const { data: props } = await supabase.from("properties").select("id,name").eq("org_id", org_id).order("created_at", { ascending: false });
-    const propSel = el("select", { class: "input" }, [
-      el("option", { value: "" }, [document.createTextNode("— Liegenschaft wählen (optional) —")]),
-      ...(props || []).map(p => el("option", { value: p.id }, [document.createTextNode(p.name)]))
-    ]);
-
-    const save = el("button", { class: "btn primary", onClick: async () => {
-      save.disabled = true;
-      try {
-        if (!plate.value.trim()) throw new Error("Kennzeichen fehlt.");
-
-        // 1) Create report
-        const payload = {
-          org_id,
-          plate: plate.value.trim(),
-          property_id: propSel.value || null,
-          location_text: locationText.value.trim() || null,
-          notes: notes.value.trim() || null,
-          lat: modal._geo?.lat || null,
-          lng: modal._geo?.lng || null,
-          accuracy_m: modal._geo?.accuracy_m || null,
-          status: "open"
-        };
-
-        const { data: rep, error: e1 } = await supabase.from("reports").insert(payload).select("id").single();
-        if (e1) throw e1;
-
-        // 2) Upload photo if present
-        const file = photoInput.files?.[0];
-        if (file) {
-          const resized = await resizeImage(file, 1600, 0.85);
-          const path = `org/${org_id}/reports/${rep.id}/${Date.now()}-${safeName(file.name || "photo.jpg")}`;
-          const { error: eUp } = await supabase.storage.from("captures").upload(path, resized, { upsert: false, contentType: resized.type });
-          if (eUp) throw eUp;
-
-          const { error: e2 } = await supabase.from("report_photos").insert({
-            org_id,
-            report_id: rep.id,
-            storage_path: path,
-            content_type: resized.type,
-            bytes: resized.size
-          });
-          if (e2) throw e2;
-        }
-
-        showToast("Report erstellt.");
-        close(); render();
-
-      } catch (e) {
-        showToast(e.message || "Fehler");
-      } finally { save.disabled = false; }
-    } }, [el("span", { html: "Speichern" })]);
-
-    const sheet = el("div", { class: "sheet" }, [
-      el("div", { class: "row spread" }, [
-        el("div", { class: "title", html: "Neuer Verstoss" }),
-        el("button", { class: "btn", onClick: close }, [el("span", { html: "Schliessen" })])
-      ]),
-      el("div", { class: "sep" }),
-      el("div", { class: "two" }, [
-        el("div", { class: "field" }, [el("div", { class: "label", html: "Kennzeichen" }), plate]),
-        el("div", { class: "field" }, [el("div", { class: "label", html: "Liegenschaft" }), propSel]),
-      ]),
-      el("div", { class: "field" }, [el("div", { class: "label", html: "Ort" }), locationText]),
-      el("div", { class: "field" }, [el("div", { class: "label", html: "Notizen" }), notes]),
-      el("div", { class: "two" }, [
-        el("div", { class: "field" }, [el("div", { class: "label", html: "Foto (optional)" }), photoInput]),
-        el("div", { class: "field" }, [el("div", { class: "label", html: "GPS" }), geoBtn]),
-      ]),
-      el("div", { class: "actions" }, [save])
-    ]);
-
-    modal.append(sheet);
-    document.body.append(modal);
-    function close() { modal.remove(); }
-  }
+  $("#reportList").addEventListener("click", async (e) => {
+    const id = e.target.closest("button")?.getAttribute("data-view");
+    if (!id) return;
+    await renderReportDetail(id);
+  });
 }
 
-function SettingsPage() {
-  if (!requireAuth()) return CenterCard("Weiterleitung…", el("div"));
-  const user = state.session?.user;
+async function renderReportDetail(reportId) {
+  const orgId = state.org?.id;
+  const { data: r, error } = await supabase
+    .from("reports")
+    .select("*, property:properties(name), photos:report_photos(id, storage_path, created_at)")
+    .eq("org_id", orgId)
+    .eq("id", reportId)
+    .single();
 
-  const body = el("div", { class: "card" }, [
-    el("div", { class: "hd" }, [el("h2", { html: "Settings" })]),
-    el("div", { class: "bd" }, [
-      el("div", { class: "list" }, [
-        el("div", { class: "item" }, [
-          el("div", {}, [
-            el("div", { class: "title", html: "Account" }),
-            el("div", { class: "sub", html: user?.email || "—" })
-          ]),
-          el("span", { class: "badge", html: "Supabase Auth" })
-        ]),
-        el("div", { class: "item" }, [
-          el("div", {}, [
-            el("div", { class: "title", html: "Mandat" }),
-            el("div", { class: "sub", html: state.activeOrgId ? (state.orgs.find(o=>o.id===state.activeOrgId)?.name || "—") : "—" })
-          ]),
-          el("button", { class: "btn", onClick: openOrgSheet }, [el("span", { html: "Wechseln" })])
-        ]),
-      ]),
-      el("div", { class: "sep" }),
-      el("div", { class: "row wrap" }, [
-        el("button", { class: "btn", onClick: () => location.hash = "#/onboarding" }, [el("span", { html: icon("plus") }), el("span", { html: "Neues Mandat" })]),
-        el("button", { class: "btn danger", onClick: async () => {
-          await supabase.auth.signOut();
-          showToast("Abgemeldet.");
-          location.hash = "#/login";
-        } }, [el("span", { html: "Abmelden" })])
-      ]),
-      el("div", { class: "sep" }),
-      el("div", { class: "muted small", html: "Updates: Diese PWA aktualisiert sich automatisch (kein Ctrl+F5 nötig)." })
-    ])
-  ]);
+  if (error) return toast(error.message, "err");
 
-  return body;
-}
-
-// ---------- Utils (photo resize) ----------
-function safeName(s) {
-  return (s || "file").replace(/[^a-zA-Z0-9._-]+/g, "_");
-}
-
-async function resizeImage(file, maxW = 1600, quality = 0.85) {
-  // Converts to JPEG (keeps original type if already jpeg/png but output as jpeg for size)
-  const img = await new Promise((resolve, reject) => {
-    const i = new Image();
-    i.onload = () => resolve(i);
-    i.onerror = reject;
-    i.src = URL.createObjectURL(file);
+  // Build signed URLs for photos (private bucket recommended)
+  const photoItems = (r.photos || []).map((p) => {
+    const { data } = supabase.storage.from("captures").getPublicUrl(p.storage_path);
+    // If bucket is private, switch to createSignedUrl in your setup.
+    return { ...p, url: data.publicUrl };
   });
 
-  const ratio = Math.min(1, maxW / img.width);
+  renderShell(`
+    <div class="card">
+      <h2>Bericht</h2>
+      <p><b>Kennzeichen:</b> ${escapeHtml(r.plate||"-")}</p>
+      <p><b>Liegenschaft:</b> ${escapeHtml(r.property?.name||"-")}</p>
+      <p><b>Zeit:</b> ${escapeHtml(fmtDate(r.occurred_at || r.created_at))}</p>
+      ${r.lat && r.lng ? `<p><b>Geo:</b> ${r.lat.toFixed(6)}, ${r.lng.toFixed(6)}</p>` : ``}
+      <hr class="sep"/>
+      <p>${escapeHtml(r.notes||"")}</p>
+
+      <hr class="sep"/>
+      <h2>Fotos</h2>
+      <div class="grid cols-3">
+        ${photoItems.length ? photoItems.map(p => `
+          <a class="card" style="padding:10px;text-decoration:none" href="${escapeHtml(p.url)}" target="_blank" rel="noreferrer">
+            <img src="${escapeHtml(p.url)}" alt="Foto" style="width:100%;border-radius:14px;border:1px solid var(--line)"/>
+            <div class="meta" style="margin-top:6px">${fmtDate(p.created_at)}</div>
+          </a>
+        `).join("") : `<div class="notice">Keine Fotos vorhanden.</div>`}
+      </div>
+
+      <hr class="sep"/>
+      <div style="display:flex;gap:10px;flex-wrap:wrap">
+        <button class="btn" id="btnBack">Zur Liste</button>
+        <button class="btn danger" id="btnDel">Löschen</button>
+      </div>
+    </div>
+  `);
+
+  wireNavbar();
+  $("#btnBack").addEventListener("click", () => location.hash = "#/reports");
+  $("#btnDel").addEventListener("click", async () => {
+    if (!confirm("Bericht wirklich löschen?")) return;
+    const { error: e1 } = await supabase.from("report_photos").delete().eq("report_id", reportId);
+    if (e1) return toast(e1.message, "err");
+    const { error: e2 } = await supabase.from("reports").delete().eq("id", reportId);
+    if (e2) return toast(e2.message, "err");
+    toast("Bericht gelöscht.", "ok");
+    location.hash = "#/reports";
+  });
+}
+
+function renderReportCreate(propsList) {
+  const orgId = state.org?.id;
+  const propOptions = propsList.map(p => `<option value="${p.id}">${escapeHtml(p.name)}</option>`).join("");
+
+  renderShell(`
+    <div class="grid cols-2">
+      <div class="card">
+        <h2>Neuer Bericht</h2>
+        <p>Foto + Notizen + Kennzeichen + (optional) Standort.</p>
+
+        <div class="label">Liegenschaft</div>
+        <select class="input" id="rProperty">
+          ${propOptions || `<option value="">(keine Liegenschaft)</option>`}
+        </select>
+
+        <div class="label">Kennzeichen</div>
+        <input class="input" id="rPlate" placeholder="ZH123456"/>
+
+        <div class="label">Notizen</div>
+        <textarea class="input" id="rNotes" rows="5" placeholder="z.B. auf Besucherparkplatz, keine Bewilligung sichtbar" style="resize:vertical"></textarea>
+
+        <div class="row" style="margin-top:10px">
+          <button class="btn" id="btnGeo">Standort erfassen</button>
+          <div class="chip" id="geoState">Geo: –</div>
+        </div>
+
+        <div class="label">Foto</div>
+        <input class="input" id="rPhoto" type="file" accept="image/*" capture="environment"/>
+
+        <div style="display:flex;gap:10px;margin-top:14px;flex-wrap:wrap">
+          <button class="btn primary" id="btnSaveReport">Speichern</button>
+          <button class="btn" id="btnCancel">Abbrechen</button>
+        </div>
+
+        <div class="notice" style="margin-top:12px">
+          Hinweis: Wenn dein Bucket <b>private</b> ist, nutze Signed URLs (kann ich dir als nächstes einbauen).
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>Preview</h2>
+        <div class="notice" id="previewText">Noch kein Foto.</div>
+        <img id="previewImg" style="display:none;width:100%;border-radius:14px;border:1px solid var(--line)"/>
+      </div>
+    </div>
+  `);
+
+  wireNavbar();
+
+  const geo = { lat:null, lng:null };
+
+  $("#btnCancel").addEventListener("click", () => location.hash = "#/reports");
+
+  $("#btnGeo").addEventListener("click", async () => {
+    if (!navigator.geolocation) return toast("Geolocation nicht verfügbar.", "err");
+    $("#geoState").textContent = "Geo: ...";
+    navigator.geolocation.getCurrentPosition(
+      (pos) => {
+        geo.lat = pos.coords.latitude;
+        geo.lng = pos.coords.longitude;
+        $("#geoState").textContent = `Geo: ${geo.lat.toFixed(5)}, ${geo.lng.toFixed(5)}`;
+        toast("Standort erfasst.", "ok");
+      },
+      (err) => {
+        $("#geoState").textContent = "Geo: –";
+        toast("Standort nicht verfügbar: " + err.message, "err");
+      },
+      { enableHighAccuracy: true, timeout: 8000 }
+    );
+  });
+
+  $("#rPhoto").addEventListener("change", async (e) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    const url = URL.createObjectURL(file);
+    $("#previewImg").src = url;
+    $("#previewImg").style.display = "block";
+    $("#previewText").style.display = "none";
+  });
+
+  $("#btnSaveReport").addEventListener("click", async () => {
+    const plate = $("#rPlate").value.trim().replace(/\s+/g,"").toUpperCase() || null;
+    const property_id = $("#rProperty").value || null;
+    const notes = $("#rNotes").value.trim() || null;
+    const occurred_at = new Date().toISOString();
+
+    // Insert report
+    const { data: report, error: e1 } = await supabase
+      .from("reports")
+      .insert({ org_id: orgId, property_id, plate, notes, occurred_at, lat: geo.lat, lng: geo.lng })
+      .select("*")
+      .single();
+    if (e1) return toast(e1.message, "err");
+
+    // Upload photo if present
+    const file = $("#rPhoto").files?.[0];
+    if (file) {
+      try {
+        const resized = await downscaleImage(file, 1600, 1600, 0.86);
+        const path = `org/${orgId}/reports/${report.id}/${Date.now()}_${safeName(file.name || "capture.jpg")}`;
+        const up = await supabase.storage.from("captures").upload(path, resized, { contentType: resized.type, upsert: true });
+        if (up.error) throw up.error;
+
+        const { error: e2 } = await supabase.from("report_photos").insert({
+          report_id: report.id,
+          org_id: orgId,
+          storage_path: path
+        });
+        if (e2) throw e2;
+      } catch (err) {
+        console.warn(err);
+        toast("Bericht gespeichert, Foto-Upload fehlgeschlagen: " + (err.message || err), "err");
+        location.hash = "#/reports";
+        return;
+      }
+    }
+
+    toast("Bericht gespeichert.", "ok");
+    location.hash = "#/reports";
+  });
+}
+
+function safeName(name) {
+  return String(name).replace(/[^a-zA-Z0-9._-]+/g, "_").slice(0, 120);
+}
+
+async function downscaleImage(file, maxW, maxH, quality=0.85) {
+  // Client-side resize for faster uploads
+  const img = await fileToImage(file);
+  const ratio = Math.min(maxW / img.width, maxH / img.height, 1);
   const w = Math.round(img.width * ratio);
   const h = Math.round(img.height * ratio);
 
   const canvas = document.createElement("canvas");
-  canvas.width = w; canvas.height = h;
+  canvas.width = w;
+  canvas.height = h;
   const ctx = canvas.getContext("2d");
   ctx.drawImage(img, 0, 0, w, h);
 
   const blob = await new Promise((resolve) => canvas.toBlob(resolve, "image/jpeg", quality));
-  return new File([blob], safeName(file.name || "photo.jpg").replace(/\.\w+$/, ".jpg"), { type: "image/jpeg" });
+  return new File([blob], "capture.jpg", { type: "image/jpeg" });
 }
 
-// ---------- Render ----------
-async function render() {
-  const h = route();
-
-  // If already logged in, never stay on login/register
-  if (state.session && routesPublic.has(h)) {
-    location.hash = \"#/\";
-    return;
-  }
-
-  // Guard: If logged in but no orgs, push onboarding (unless on public route)
-  if (state.session && !state.orgs.length && !routesPublic.has(h) && h !== "#/onboarding") {
-    location.hash = "#/onboarding";
-    return;
-  }
-
-  // Public routes
-  if (h.startsWith("#/login")) { PageShell("#/login", LoginPage()); return; }
-  if (h.startsWith("#/register")) { PageShell("#/register", RegisterPage()); return; }
-
-  // Private
-  if (!state.session) { PageShell("#/login", LoginPage()); return; }
-
-  if (h.startsWith("#/onboarding")) { PageShell("#/settings", OnboardingPage()); return; }
-
-  if (h === "#/" || h.startsWith("#/dashboard")) {
-    const node = await DashboardPage();
-    PageShell("#/", node);
-    return;
-  }
-  if (h.startsWith("#/properties")) {
-    const node = await PropertiesPage();
-    PageShell("#/properties", node);
-    return;
-  }
-  if (h.startsWith("#/permits")) {
-    const node = await PermitsPage();
-    PageShell("#/permits", node);
-    return;
-  }
-  if (h.startsWith("#/reports")) {
-    const node = await ReportsPage();
-    PageShell("#/reports", node);
-    return;
-  }
-  if (h.startsWith("#/settings")) {
-    const node = SettingsPage();
-    PageShell("#/settings", node);
-    return;
-  }
-
-  // Fallback
-  location.hash = "#/";
+function fileToImage(file) {
+  return new Promise((resolve, reject) => {
+    const url = URL.createObjectURL(file);
+    const img = new Image();
+    img.onload = () => { URL.revokeObjectURL(url); resolve(img); };
+    img.onerror = (e) => reject(e);
+    img.src = url;
+  });
 }
 
+// --------- Settings ----------
+async function renderSettings() {
+  const orgId = state.org?.id;
+
+  renderShell(`
+    <div class="grid cols-2">
+      <div class="card">
+        <h2>Einstellungen</h2>
+        <p>App- und Mandats-Einstellungen.</p>
+        <hr class="sep"/>
+
+        <div class="label">Aktives Mandat</div>
+        <select class="input" id="orgSelect">
+          ${state.orgs.map(o => `<option value="${o.id}" ${o.id===orgId?"selected":""}>${escapeHtml(o.name)} (${escapeHtml(o.role)})</option>`).join("")}
+        </select>
+
+        <div style="display:flex;gap:10px;margin-top:14px;flex-wrap:wrap">
+          <button class="btn" id="btnNewOrg">Neues Mandat</button>
+          <button class="btn danger" id="btnSignOut">Logout</button>
+        </div>
+
+        <hr class="sep"/>
+        <div class="notice">
+          <b>Cache-Schutz:</b> Diese App lädt JS/Config immer frisch (GitHub Pages-friendly).
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>Entwickler</h2>
+        <p>Hier kannst du später Feature-Toggles, Rollen, Team-Einladungen etc. ergänzen.</p>
+        <hr class="sep"/>
+        <button class="btn" id="btnResetSW">PWA Reset (nur wenn nötig)</button>
+        <div class="notice" style="margin-top:12px">
+          Wenn du die App installiert hast und sie sich “starr” verhält, kannst du einmalig den Service Worker löschen.
+        </div>
+      </div>
+    </div>
+  `);
+
+  wireNavbar();
+
+  $("#orgSelect").addEventListener("change", async (e) => {
+    localStorage.setItem("pp_active_org", e.target.value);
+    await loadOrgContext();
+    toast("Mandat gewechselt", "ok");
+    location.hash = "#/dashboard";
+  });
+
+  $("#btnNewOrg").addEventListener("click", () => location.hash = "#/onboarding");
+  $("#btnSignOut").addEventListener("click", async () => {
+    await supabase.auth.signOut();
+    location.hash = "#/login";
+  });
+
+  $("#btnResetSW").addEventListener("click", async () => {
+    if (!("serviceWorker" in navigator)) return toast("Kein Service Worker.", "err");
+    const regs = await navigator.serviceWorker.getRegistrations();
+    await Promise.all(regs.map(r => r.unregister()));
+    toast("Service Worker entfernt. Seite lädt neu.", "ok");
+    setTimeout(() => location.reload(), 600);
+  });
+}
+
+// Boot
+if (!location.hash) location.hash = "#/login";
+await router();

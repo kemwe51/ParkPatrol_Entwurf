@@ -1,3 +1,4 @@
 #!/usr/bin/env bash
-cd "$(dirname "$0")"
-python3 -m http.server 5173
+set -e
+echo "Serving on http://localhost:5173"
+npx -y serve . -l 5173

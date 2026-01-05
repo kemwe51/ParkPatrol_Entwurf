@@ -2,19 +2,27 @@
 <html lang="de">
 <head>
   <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
-  <meta name="mobile-web-app-capable" content="yes" />
-  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-capable" content="yes">
   <meta name="theme-color" content="#0b0f1a" />
-  <link rel="manifest" href="./manifest.webmanifest" />
-  <link rel="icon" sizes="192x192" href="./icon-192.png" />
-  <link rel="apple-touch-icon" href="./icon-192.png" />
   <title>ParkPatrol</title>
+
+  <!-- Cache-safety for GitHub Pages: we use dynamic import + SW network-first no-store -->
+  <link rel="manifest" href="./manifest.webmanifest" />
+  <link rel="icon" href="./icon-192.png" />
+  <link rel="apple-touch-icon" href="./icon-192.png" />
+
   <link rel="stylesheet" href="./styles.css" />
 </head>
 <body>
   <div id="app"></div>
-  <div id="toast" class="toast" hidden></div>
-  <script type="module" src="./app.js"></script>
+
+  <script type="module">
+    // Ultra-stable updates on GitHub Pages:
+    // Always load latest app.js (no more Ctrl+F5).
+    const v = Date.now();
+    import(`./app.js?v=${v}`);
+  </script>
 </body>
 </html>
