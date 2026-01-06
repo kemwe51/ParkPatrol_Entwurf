@@ -3,38 +3,14 @@
 
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 
-// --------- dynamic config import (also cache-busted) ----------
-const _v = Date.now();
-const cfg = await import(`./config.js?v=${_v}`);
-const { SUPABASE_URL, SUPABASE_ANON_KEY, APP_NAME } = cfg;
+// --------- config + supabase init (NO top-level await) ----------
+let SUPABASE_URL = "";
+let SUPABASE_ANON_KEY = "";
+let APP_NAME = "ParkPatrol";
+let supabase = null;
 
-if (!SUPABASE_URL || !SUPABASE_ANON_KEY || SUPABASE_ANON_KEY.includes("PASTE_YOUR_SUPABASE")) {
-  console.warn("Supabase config missing. Fill SUPABASE_URL + SUPABASE_ANON_KEY in config.js");
-}
+// NOTE: supabase is initialized in initApp() at the bottom of this file.
 
-// Supabase client: persist session across reloads
-const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
-  auth: { persistSession: true, autoRefreshToken: true, detectSessionInUrl: true }
-});
-
-// --------- PWA / Service Worker (no hard refresh needed) ----------
-async function registerServiceWorker() {
-  if (!("serviceWorker" in navigator)) return;
-  try {
-    const reg = await navigator.serviceWorker.register("./sw.js", { scope: "./", updateViaCache: "none" });
-    // Proactively check for updates
-    reg.update().catch(() => {});
-    // If waiting, activate right away
-    if (reg.waiting) reg.waiting.postMessage({ type: "SKIP_WAITING" });
-    navigator.serviceWorker.addEventListener("controllerchange", () => {
-      // Reload once to move onto the new SW.
-      location.reload();
-    });
-  } catch (e) {
-    console.warn("SW register failed", e);
-  }
-}
-registerServiceWorker();
 
 // --------- Utilities ----------
 const $ = (sel, el = document) => el.querySelector(sel);
@@ -71,9 +47,6 @@ const state = {
   route: "#/login"
 };
 
-
-// --------- Edge Functions ---------
-const FN_PLATE_OCR = "plate-ocr";
 // --------- Schema expectations (from 001_init.sql) ----------
 // public.organizations(id, name, created_at, owner_id)
 // public.org_members(org_id, user_id, role, created_at)
@@ -182,11 +155,6 @@ async function router() {
   location.hash = state.user ? "#/dashboard" : "#/login";
 }
 
-// Keep live auth state
-supabase.auth.onAuthStateChange((_event, session) => {
-  state.session = session;
-  state.user = session?.user ?? null;
-});
 
 // --------- Data Loading ----------
 async function loadOrgContext() {
@@ -829,84 +797,111 @@ async function renderReportDetail(reportId) {
   });
 }
 
+
 function renderReportCreate(propsList) {
   const orgId = state.org?.id;
-  const propOptions = propsList.map(p => `<option value="${p.id}">${escapeHtml(p.name)}</option>`).join("");
+  if (!orgId) return renderOnboarding();
+
+  const options = (propsList || [])
+    .map((p) => `<option value="${p.id}">${escapeHtml(p.name)}</option>`)
+    .join("");
 
   renderShell(`
-    <div class="grid cols-2">
-      <div class="card">
-        <h2>Neuer Bericht</h2>
-        <p>Foto + Notizen + Kennzeichen + (optional) Standort.</p>
+    <div class="container">
+      <div class="grid cols-2">
+        <div class="card">
+          <div style="display:flex;align-items:center;justify-content:space-between;gap:12px">
+            <h2 style="margin:0">Neuer Bericht</h2>
+            <button class="btn ghost" id="btnCancel">Abbrechen</button>
+          </div>
 
-        <div class="label">Liegenschaft</div>
-        <select class="input" id="rProperty">
-          ${propOptions || `<option value="">(keine Liegenschaft)</option>`}
-        </select>
+          <div class="label">Liegenschaft</div>
+          <select class="input" id="rProperty">
+            <option value="">(optional)</option>
+            ${options}
+          </select>
 
-        <div class="label">Kennzeichen</div>
-        <input class="input" id="rPlate" placeholder="ZH123456"/>
+          <div class="label">Kennzeichen</div>
+          <input class="input" id="rPlate" placeholder="z.B. ZH123456" autocomplete="off" />
 
-        <div class="label">Notizen</div>
-        <textarea class="input" id="rNotes" rows="5" placeholder="z.B. auf Besucherparkplatz, keine Bewilligung sichtbar" style="resize:vertical"></textarea>
+          <div class="label">Notizen</div>
+          <textarea class="input" id="rNotes" rows="5" placeholder="z.B. keine Bewilligung sichtbar" style="resize:vertical"></textarea>
 
-        <div class="row" style="margin-top:10px">
-          <button class="btn" id="btnGeo">Standort erfassen</button>
-          <div class="chip" id="geoState">Geo: –</div>
+          <div class="row" style="margin-top:10px">
+            <button class="btn" id="btnGeo">Standort erfassen</button>
+            <div class="chip" id="geoState">Geo: –</div>
+          </div>
+
+          <div class="label">Foto</div>
+          <input class="input" id="rPhoto" type="file" accept="image/*" capture="environment"/>
+
+          <div class="row" style="margin-top:10px">
+            <button class="btn" id="btnOcr">OCR aus Foto</button>
+            <div class="chip" id="ocrState">OCR: –</div>
+          </div>
+
+          <div style="display:flex;gap:10px;margin-top:14px;flex-wrap:wrap">
+            <button class="btn primary" id="btnSaveReport">Speichern</button>
+            <div class="notice" style="margin:0;flex:1;min-width:220px">
+              Tipp: Foto wählen → OCR klicken → Kennzeichen wird automatisch gesetzt.
+            </div>
+          </div>
         </div>
 
-        <div class="label">Foto</div>
-        <input class="input" id="rPhoto" type="file" accept="image/*" capture="environment"/>
-
-        <div class="row" style="margin-top:10px">
-          <button class="btn" id="btnOcr">OCR aus Foto</button>
-          <div class="chip" id="ocrState">OCR: –</div>
+        <div class="card">
+          <h2>Preview</h2>
+          <div class="notice" id="previewText">Noch kein Foto.</div>
+          <img id="previewImg" style="display:none;width:100%;border-radius:14px;border:1px solid var(--line)"/>
         </div>
-
-        <div style="display:flex;gap:10px;margin-top:14px;flex-wrap:wrap">
-          <button class="btn primary" id="btnSaveReport">Speichern</button>
-          <button class="btn" id="btnCancel">Abbrechen</button>
-        </div>
-
-        <div class="notice" style="margin-top:12px">
-          Hinweis: Wenn dein Bucket <b>private</b> ist, nutze Signed URLs (kann ich dir als nächstes einbauen).
-        </div>
-      </div>
-
-      <div class="card">
-        <h2>Preview</h2>
-        <div class="notice" id="previewText">Noch kein Foto.</div>
-        <img id="previewImg" style="display:none;width:100%;border-radius:14px;border:1px solid var(--line)"/>
       </div>
     </div>
   `);
 
   wireNavbar();
 
-  const geo = { lat:null, lng:null };
-  let ocrRunToken = 0;
-  const setOcrState = (t) => { const el = $("#ocrState"); if (el) el.textContent = t; };
+  const geo = { lat: null, lng: null };
 
-  // Draft state: We create a report row early (for OCR) and finalize/update on Save.
+  // Draft / OCR state
   let draftReportId = null;
   let draftPhotoPath = null;
   let draftPhotoSig = null;
+  let ocrRunToken = 0;
 
-  const _normalizePlate = (s) => String(s || "")
-    .toUpperCase()
-    .replace(/[^A-Z0-9]/g, "");
+  const setGeoState = () => {
+    const el = $("#geoState");
+    if (!el) return;
+    if (geo.lat && geo.lng) el.textContent = `Geo: ${geo.lat.toFixed(5)}, ${geo.lng.toFixed(5)}`;
+    else el.textContent = "Geo: –";
+  };
+
+  const setOcrState = (t) => {
+    const el = $("#ocrState");
+    if (el) el.textContent = t;
+  };
+
+  const normalizePlate = (s) =>
+    String(s || "").toUpperCase().replace(/[^A-Z0-9]/g, "");
 
   const ensureDraftReport = async () => {
     if (draftReportId) return draftReportId;
 
-    const plate0 = $("#rPlate").value.trim().replace(/\s+/g,"").toUpperCase() || null;
-    const property_id0 = $("#rProperty").value || null;
-    const notes0 = $("#rNotes").value.trim() || null;
-    const occurred_at0 = new Date().toISOString();
+    const property_id = $("#rProperty")?.value || null;
+    const plate0 = normalizePlate($("#rPlate")?.value || "") || null;
+    const notes0 = ($("#rNotes")?.value || "").trim() || null;
+
+    const payload = {
+      org_id: orgId,
+      property_id,
+      plate: plate0,
+      notes: notes0,
+      occurred_at: new Date().toISOString(),
+      lat: geo.lat,
+      lng: geo.lng
+    };
 
     const { data, error } = await supabase
       .from("reports")
-      .insert({ org_id: orgId, property_id: property_id0, plate: plate0, notes: notes0, occurred_at: occurred_at0, lat: geo.lat, lng: geo.lng })
+      .insert(payload)
       .select("id")
       .single();
 
@@ -917,123 +912,363 @@ function renderReportCreate(propsList) {
 
   const ensurePhotoUploadedForDraft = async () => {
     const file = $("#rPhoto")?.files?.[0];
-    if (!file) throw new Error("Bitte zuerst ein Foto wählen.");
+    if (!file) throw new Error("Bitte zuerst ein Foto auswählen.");
 
-    const sig = `${file.name}|${file.size}|${file.lastModified}`;
+    const sig = `${file.name}:${file.size}:${file.lastModified}`;
     const reportId = await ensureDraftReport();
 
-    if (draftPhotoPath && draftPhotoSig === sig) return { reportId, path: draftPhotoPath };
-
-    // Replace previous uploaded photo if user changed the file
-    if (draftPhotoPath && draftPhotoSig !== sig) {
-      try { await supabase.storage.from("captures").remove([draftPhotoPath]); } catch {}
-      try { await supabase.from("report_photos").delete().eq("report_id", reportId).eq("storage_path", draftPhotoPath); } catch {}
-      draftPhotoPath = null;
-      draftPhotoSig = null;
+    if (draftPhotoSig === sig && draftPhotoPath) {
+      return { reportId, path: draftPhotoPath };
     }
 
-    const resized = await resizeImageFile(file, MAX_EDGE, JPEG_QUALITY);
-    const path = `org/${orgId}/reports/${reportId}/${Date.now()}_${safeName(file.name || "capture.jpg")}`;
+    // Cleanup old upload (best-effort)
+    try {
+      if (draftPhotoPath) {
+        await supabase.from("report_photos").delete().eq("report_id", reportId).eq("storage_path", draftPhotoPath);
+        await supabase.storage.from("captures").remove([draftPhotoPath]);
+      }
+    } catch {}
 
-    const up = await supabase.storage.from("captures").upload(path, resized, { contentType: resized.type, upsert: true });
+    const blob = await downscaleImage(file, 1600, 1600, 0.85);
+    const path = `${orgId}/reports/${reportId}/${Date.now()}_${safeName(file.name || "capture.jpg")}`;
+
+    const up = await supabase.storage.from("captures").upload(path, blob, {
+      upsert: true,
+      contentType: "image/jpeg"
+    });
     if (up.error) throw up.error;
 
-    const { error: e2 } = await supabase.from("report_photos").insert({
+    const { error: insErr } = await supabase.from("report_photos").insert({
       report_id: reportId,
       org_id: orgId,
       storage_path: path
+    });
+    if (insErr) throw insErr;
+
+    draftPhotoSig = sig;
+    draftPhotoPath = path;
+
+    return { reportId, path };
+  };
+
+  const runOcrForSelectedPhoto = async () => {
+    const file = $("#rPhoto")?.files?.[0];
+    if (!file) return toast("Bitte Foto auswählen.", "err");
+
+    const myToken = ++ocrRunToken;
+    setOcrState("OCR: läuft…");
+
+    try {
+      const { reportId, path } = await ensurePhotoUploadedForDraft();
+      if (myToken !== ocrRunToken) return;
+
+      const { data, error } = await supabase.functions.invoke("plate-ocr", {
+        body: {
+          id: reportId,
+          image_path: path,
+          record: { id: reportId, image_path: path }
+        }
+      });
+
+      if (error) throw error;
+      if (!data?.ok) {
+        const msg = (data?.stage ? `[${data.stage}] ` : "") + (data?.error || "OCR fehlgeschlagen");
+        throw new Error(msg);
+      }
+
+      const plate = normalizePlate(String(data?.plate || "").replace(";", ""));
+      if (!plate || plate.length < 4) {
+        setOcrState("OCR: kein Treffer");
+        return toast("Kein Kennzeichen erkannt. Bitte manuell eingeben.", "err");
+      }
+
+      const plateEl = $("#rPlate");
+      if (plateEl) plateEl.value = plate;
+
+      setOcrState("OCR: erkannt ✓");
+      toast(`Kennzeichen erkannt: ${plate}`, "ok");
+
+      // Keep DB in sync (best-effort)
+      try { await supabase.from("reports").update({ plate }).eq("id", reportId); } catch {}
+    } catch (e) {
+      console.error(e);
+      setOcrState("OCR: Fehler");
+      toast(String(e?.message || e), "err");
+    }
+  };
+
+  // --- UI wiring -----------------------------------------------------------
+
+  $("#btnCancel")?.addEventListener("click", async () => {
+    const goBack = () => (location.hash = "#/reports");
+    if (!draftReportId && !draftPhotoPath) return goBack();
+
+    if (!confirm("Entwurf verwerfen?")) return;
+
+    try {
+      if (draftPhotoPath) {
+        try { await supabase.storage.from("captures").remove([draftPhotoPath]); } catch {}
+        try { await supabase.from("report_photos").delete().eq("report_id", draftReportId); } catch {}
+      }
+      if (draftReportId) {
+        try { await supabase.from("reports").delete().eq("id", draftReportId); } catch {}
+      }
+    } catch {}
+    goBack();
   });
-$("#btnGeo").addEventListener("click", async () => {
+
+  $("#btnGeo")?.addEventListener("click", async () => {
+    setGeoState();
     if (!navigator.geolocation) return toast("Geolocation nicht verfügbar.", "err");
-    $("#geoState").textContent = "Geo: ...";
+
+    $("#geoState").textContent = "Geo: …";
     navigator.geolocation.getCurrentPosition(
       (pos) => {
         geo.lat = pos.coords.latitude;
         geo.lng = pos.coords.longitude;
-        $("#geoState").textContent = `Geo: ${geo.lat.toFixed(5)}, ${geo.lng.toFixed(5)}`;
-        toast("Standort erfasst.", "ok");
+        setGeoState();
+        toast("Standort gesetzt.", "ok");
       },
       (err) => {
-        $("#geoState").textContent = "Geo: –";
-        toast("Standort nicht verfügbar: " + err.message, "err");
+        console.warn(err);
+        setGeoState();
+        toast("Standort konnte nicht ermittelt werden.", "err");
       },
-      { enableHighAccuracy: true, timeout: 8000 }
+      { enableHighAccuracy: true, timeout: 10000 }
     );
   });
 
-  $("#rPhoto").addEventListener("change", async (e) => {
-    const file = e.target.files?.[0];
-    if (!file) return;
-    const url = URL.createObjectURL(file);
-    $("#previewImg").src = url;
-    $("#previewImg").style.display = "block";
-    $("#previewText").style.display = "none";
-    setOcrState("OCR: bereit");
-    // Auto-OCR: nur wenn Kennzeichen noch leer ist (kosten-/traffic-schonend)
-    if (!$("#rPlate").value.trim()) {
-      if ("requestIdleCallback" in window) {
-        window.requestIdleCallback(() => { void runOcrForSelectedPhoto(); }, { timeout: 1200 });
-      } else {
-        setTimeout(() => { void runOcrForSelectedPhoto(); }, 350);
-      }
+  $("#rPhoto")?.addEventListener("change", () => {
+    setOcrState("OCR: –");
+
+    const file = $("#rPhoto")?.files?.[0];
+    const img = $("#previewImg");
+    const text = $("#previewText");
+    if (!file || !img) {
+      if (text) text.textContent = "Noch kein Foto.";
+      if (img) img.style.display = "none";
+      return;
     }
-});
 
-  $("#btnOcr").addEventListener("click", () => { void runOcrForSelectedPhoto(); });
+    if (text) text.textContent = "Foto gewählt.";
+    img.style.display = "block";
+    img.src = URL.createObjectURL(file);
+  });
 
-  $("#btnSaveReport").addEventListener("click", async () => {
+  $("#btnOcr")?.addEventListener("click", runOcrForSelectedPhoto);
+
+  $("#btnSaveReport")?.addEventListener("click", async () => {
     try {
-      const file = $("#rPhoto")?.files?.[0] || null;
-      let plate = $("#rPlate").value.trim().replace(/\s+/g,"").toUpperCase() || null;
-      const property_id = $("#rProperty").value || null;
-      const notes = $("#rNotes").value.trim() || null;
-      const occurred_at = new Date().toISOString();
+      const reportId = await ensureDraftReport();
 
-      // Ensure we have a report id (draft) so photo + OCR can attach reliably
-      if (!draftReportId) {
-        const { data, error } = await supabase
-          .from("reports")
-          .insert({ org_id: orgId, property_id, plate, notes, occurred_at, lat: geo.lat, lng: geo.lng })
-          .select("id")
-          .single();
-        if (error) throw error;
-        draftReportId = data.id;
-      } else {
-        const { error } = await supabase
-          .from("reports")
-          .update({ property_id, plate, notes, occurred_at, lat: geo.lat, lng: geo.lng })
-          .eq("id", draftReportId);
-        if (error) throw error;
+      // If user didn't click OCR and plate is empty, try once (best-effort)
+      const file = $("#rPhoto")?.files?.[0];
+      const plate0 = normalizePlate($("#rPlate")?.value || "");
+      if ((!plate0 || plate0.length < 4) && file) {
+        await runOcrForSelectedPhoto();
       }
 
-      // Upload photo (if provided)
+      const payload = {
+        property_id: $("#rProperty")?.value || null,
+        plate: normalizePlate($("#rPlate")?.value || "") || null,
+        notes: ($("#rNotes")?.value || "").trim() || null,
+        occurred_at: new Date().toISOString(),
+        lat: geo.lat,
+        lng: geo.lng
+      };
+
+      const { error } = await supabase.from("reports").update(payload).eq("id", reportId);
+      if (error) throw error;
+
+      // Ensure photo is uploaded if present (OCR may already have done it)
       if (file) {
         await ensurePhotoUploadedForDraft();
       }
 
-      // If plate is missing and a photo exists, run OCR once before finishing (best UX)
-      if ((!plate || plate.length < 4) && file) {
-        await runOcrForSelectedPhoto();
-        plate = $("#rPlate").value.trim().replace(/\s+/g,"").toUpperCase() || null;
-      }
-
-      // Final update (to ensure latest values are stored)
-      const { error: eFinal } = await supabase
-        .from("reports")
-        .update({ property_id, plate, notes, occurred_at, lat: geo.lat, lng: geo.lng })
-        .eq("id", draftReportId);
-      if (eFinal) throw eFinal;
-
       toast("Bericht gespeichert.", "ok");
       location.hash = "#/reports";
-    } catch (err) {
-      console.warn(err);
-      toast((err?.message || String(err)), "err");
+    } catch (e) {
+      console.error(e);
+      toast(String(e?.message || e), "err");
     }
   });
 }
 
 
+// --------- OCR (Client-side, no backend required) ----------
+// Uses Tesseract.js via CDN, loaded lazily only when OCR is triggered.
+// Goal: extract Swiss license plates (e.g., ZH123456) from a photo.
+
+const _CH_CANTONS = new Set([
+  "AG","AI","AR","BE","BL","BS","FR","GE","GL","GR","JU","LU","NE","NW","OW","SG","SH","SO","SZ","TG","TI","UR","VD","VS","ZG","ZH","FL"
+]);
+
+function _extractPlateFromText(text) {
+  const s = String(text || "")
+    .toUpperCase()
+    .replace(/[^A-Z0-9\s]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  // Swiss-style: 2 letters + 1..6 digits
+  const candidates = [];
+  for (const m of s.matchAll(/(?:^|\s)([A-Z]{2})\s*([0-9]{1,6})(?=\s|$)/g)) {
+    const code = m[1];
+    const digits = m[2];
+    if (!_CH_CANTONS.has(code)) continue;
+    const plate = `${code}${digits}`;
+    // Prefer typical lengths (4-6 digits), but keep all
+    const score = (digits.length >= 4 ? 1 : 0.6) + (digits.length >= 5 ? 0.2 : 0);
+    candidates.push({ plate, score });
+  }
+
+  // Fallback: any A..Z + digits (useful for EU plates), keep conservative
+  if (!candidates.length) {
+    for (const m of s.matchAll(/(?:^|\s)([A-Z]{1,3})([0-9]{1,4})([A-Z]{1,3})(?=\s|$)/g)) {
+      const plate = `${m[1]}${m[2]}${m[3]}`;
+      if (plate.length < 5) continue;
+      candidates.push({ plate, score: 0.4 });
+    }
+  }
+
+  candidates.sort((a, b) => b.score - a.score);
+  return candidates[0]?.plate || null;
+}
+
+async function _fileToCanvas(file, maxEdge = 1600) {
+  const img = await fileToImage(file);
+  const ratio = Math.min(maxEdge / img.width, maxEdge / img.height, 1);
+  const w = Math.max(1, Math.round(img.width * ratio));
+  const h = Math.max(1, Math.round(img.height * ratio));
+  const c = document.createElement("canvas");
+  c.width = w; c.height = h;
+  const ctx = c.getContext("2d");
+  ctx.drawImage(img, 0, 0, w, h);
+  return c;
+}
+
+function _cropCanvas(src, x, y, w, h) {
+  const c = document.createElement("canvas");
+  c.width = Math.max(1, Math.round(w));
+  c.height = Math.max(1, Math.round(h));
+  const ctx = c.getContext("2d");
+  ctx.drawImage(src, Math.round(x), Math.round(y), Math.round(w), Math.round(h), 0, 0, c.width, c.height);
+  return c;
+}
+
+function _enhanceForOcr(canvas) {
+  const ctx = canvas.getContext("2d");
+  const img = ctx.getImageData(0, 0, canvas.width, canvas.height);
+  const d = img.data;
+  // light grayscale + contrast bump
+  const contrast = 1.25;
+  const intercept = 128 * (1 - contrast);
+  for (let i = 0; i < d.length; i += 4) {
+    const r = d[i], g = d[i + 1], b = d[i + 2];
+    let v = 0.299 * r + 0.587 * g + 0.114 * b;
+    v = contrast * v + intercept;
+    v = v < 0 ? 0 : v > 255 ? 255 : v;
+    d[i] = d[i + 1] = d[i + 2] = v;
+    // keep alpha
+  }
+  ctx.putImageData(img, 0, 0);
+  return canvas;
+}
+
+function _buildOcrCandidates(baseCanvas) {
+  const w = baseCanvas.width;
+  const h = baseCanvas.height;
+  const crops = [];
+  crops.push(baseCanvas);
+  // Bottom region (plates often in lower part)
+  crops.push(_cropCanvas(baseCanvas, w * 0.08, h * 0.55, w * 0.84, h * 0.40));
+  // Center region
+  crops.push(_cropCanvas(baseCanvas, w * 0.12, h * 0.35, w * 0.76, h * 0.45));
+  // Make them OCR-friendly
+  return crops.map((c) => _enhanceForOcr(c));
+}
+
+async function ocrPlateFromImageFile(file, onProgress) {
+  // Lazy-load Tesseract only when needed.
+  const mod = await import("https://cdn.jsdelivr.net/npm/tesseract.js@4.1.1/dist/tesseract.esm.min.js");
+  const createWorker = mod.createWorker || mod.default?.createWorker;
+  if (!createWorker) throw new Error("Tesseract konnte nicht geladen werden.");
+
+  const baseCanvas = await _fileToCanvas(file, 1700);
+  const canvases = _buildOcrCandidates(baseCanvas);
+
+  const worker = await createWorker({
+    logger: (m) => {
+      if (m?.status === "recognizing text" && typeof m.progress === "number") onProgress?.(m.progress);
+    }
+  });
+
+  try {
+    if (worker.load) await worker.load();
+    if (worker.loadLanguage) await worker.loadLanguage("eng");
+    if (worker.initialize) await worker.initialize("eng");
+    if (worker.setParameters) {
+      await worker.setParameters({
+        tessedit_char_whitelist: "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789",
+        preserve_interword_spaces: "1"
+      });
+    }
+
+    let bestPlate = null;
+    let bestConf = -1;
+
+    for (const c of canvases) {
+      const res = await worker.recognize(c);
+      const text = res?.data?.text ?? "";
+      const plate = _extractPlateFromText(text);
+      const conf = typeof res?.data?.confidence === "number" ? res.data.confidence : 0;
+      if (plate) {
+        // Prefer higher confidence (0..100)
+        if (conf > bestConf) {
+          bestConf = conf;
+          bestPlate = plate;
+        }
+        // Early-exit if confidence looks good
+        if (conf >= 70) break;
+      }
+    }
+
+    return bestPlate;
+  } finally {
+    try { await worker.terminate(); } catch {}
+  }
+}
+
+function safeName(name) {
+  return String(name).replace(/[^a-zA-Z0-9._-]+/g, "_").slice(0, 120);
+}
+
+async function downscaleImage(file, maxW, maxH, quality=0.85) {
+  // Client-side resize for faster uploads
+  const img = await fileToImage(file);
+  const ratio = Math.min(maxW / img.width, maxH / img.height, 1);
+  const w = Math.round(img.width * ratio);
+  const h = Math.round(img.height * ratio);
+
+  const canvas = document.createElement("canvas");
+  canvas.width = w;
+  canvas.height = h;
+  const ctx = canvas.getContext("2d");
+  ctx.drawImage(img, 0, 0, w, h);
+
+  const blob = await new Promise((resolve) => canvas.toBlob(resolve, "image/jpeg", quality));
+  return new File([blob], "capture.jpg", { type: "image/jpeg" });
+}
+
+function fileToImage(file) {
+  return new Promise((resolve, reject) => {
+    const url = URL.createObjectURL(file);
+    const img = new Image();
+    img.onload = () => { URL.revokeObjectURL(url); resolve(img); };
+    img.onerror = (e) => reject(e);
+    img.src = url;
+  });
+}
 
 // --------- Settings ----------
 async function renderSettings() {
@@ -1098,6 +1333,63 @@ async function renderSettings() {
   });
 }
 
-// Boot
-if (!location.hash) location.hash = "#/login";
-(async () => { try { await router(); } catch (e) { console.error(e); try { toast("Fehler beim Starten: " + (e?.message ?? e), "error"); } catch {} } })();
+
+// Boot (no top-level await)
+// Initializes config + Supabase, then starts the router.
+async function initApp() {
+  try {
+    const v = Date.now();
+    const cfg = await import(`./config.js?v=${v}`);
+
+    SUPABASE_URL = cfg?.SUPABASE_URL || "";
+    SUPABASE_ANON_KEY = cfg?.SUPABASE_ANON_KEY || "";
+    APP_NAME = (cfg?.APP_NAME ?? "ParkPatrol") || "ParkPatrol";
+
+    if (!SUPABASE_URL || !SUPABASE_ANON_KEY || String(SUPABASE_ANON_KEY).includes("PASTE_YOUR_SUPABASE") || String(SUPABASE_URL).includes("your_project")) {
+      const app = document.getElementById("app");
+      if (app) {
+        app.innerHTML = `
+          <div class="topbar">
+            <div class="brand">
+              <div class="logo">PP</div>
+              <div>
+                <h1>${escapeHtml(APP_NAME)}</h1>
+                <div class="chip">Setup</div>
+              </div>
+            </div>
+          </div>
+          <div class="container">
+            <div class="card">
+              <h2>Supabase Konfiguration fehlt</h2>
+              <div class="notice err">Bitte trage SUPABASE_URL und SUPABASE_ANON_KEY in <b>config.js</b> ein und lade die Seite neu.</div>
+              <div class="notice">Tipp: auf GitHub Pages manchmal einmal neu laden (ohne Ctrl+F5) nach dem Commit.</div>
+            </div>
+          </div>
+        `;
+      }
+      return;
+    }
+
+    // Supabase client: persist session across reloads
+    supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
+      auth: { persistSession: true, autoRefreshToken: true, detectSessionInUrl: true }
+    });
+
+    // Keep live auth state
+    supabase.auth.onAuthStateChange((_event, session) => {
+      state.session = session;
+      state.user = session?.user ?? null;
+    });
+
+    // Routing
+    window.addEventListener("hashchange", () => { void router(); });
+    if (!location.hash) location.hash = "#/login";
+    await router();
+  } catch (e) {
+    console.error(e);
+    const app = document.getElementById("app");
+    if (app) app.innerHTML = `<div class="container"><div class="card"><h2>Startfehler</h2><pre style="white-space:pre-wrap">${escapeHtml(String(e))}</pre></div></div>`;
+  }
+}
+
+initApp();

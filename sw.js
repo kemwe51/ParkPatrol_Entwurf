@@ -1,54 +1,19 @@
-// sw.js - ParkPatrol Ultra Safe Updates (GitHub Pages)
-//
-// Goal: NEVER require Ctrl+F5.
-// Strategy:
-// - Do NOT "hard cache" app.js/config.js/manifest/icons/styles.
-// - Always fetch same-origin assets with cache: 'no-store' (network-first).
-// - Provide a tiny offline fallback for navigation if network is down.
-
-const OFFLINE_CACHE = "parkpatrol-offline-v2";
-const OFFLINE_URL = "./offline.html";
+// sw.js (retired) - kept for backward compatibility.
+// New versions register ./sw-v9.js
+// This worker unregisters itself on activate to eliminate stale caches.
 
 self.addEventListener("install", (event) => {
   self.skipWaiting();
-  event.waitUntil(
-    caches.open(OFFLINE_CACHE).then((c) => c.addAll([OFFLINE_URL])).catch(() => {})
-  );
 });
 
 self.addEventListener("activate", (event) => {
   event.waitUntil((async () => {
-    const keys = await caches.keys();
-    await Promise.all(keys.map((k) => (k === OFFLINE_CACHE ? null : caches.delete(k))));
-    await self.clients.claim();
-  })());
-});
-
-function isSameOrigin(url) {
-  try { return new URL(url).origin === self.location.origin; } catch { return false; }
-}
-
-self.addEventListener("fetch", (event) => {
-  const req = event.request;
-  const url = req.url;
-
-  // Only handle same-origin requests.
-  if (!isSameOrigin(url)) return;
-
-  // Network-first with no-store for everything same-origin.
-  // This avoids old cached JS/config issues entirely.
-  event.respondWith((async () => {
+    try { await self.registration.unregister(); } catch {}
     try {
-      const fresh = await fetch(new Request(req, { cache: "no-store" }));
-      return fresh;
-    } catch (e) {
-      // Offline fallback only for navigations (HTML)
-      if (req.mode === "navigate") {
-        const cache = await caches.open(OFFLINE_CACHE);
-        const cached = await cache.match(OFFLINE_URL);
-        return cached || new Response("Offline", { status: 503 });
-      }
-      throw e;
-    }
+      const cs = await self.clients.matchAll({ type: "window", includeUncontrolled: true });
+      for (const c of cs) { try { c.navigate(c.url); } catch {} }
+    } catch {}
   })());
 });
+
+self.addEventListener("fetch", () => {});
