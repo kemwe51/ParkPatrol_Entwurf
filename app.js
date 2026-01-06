@@ -71,6 +71,9 @@ const state = {
   route: "#/login"
 };
 
+
+// --------- Edge Functions ---------
+const FN_PLATE_OCR = "plate-ocr";
 // --------- Schema expectations (from 001_init.sql) ----------
 // public.organizations(id, name, created_at, owner_id)
 // public.org_members(org_id, user_id, role, created_at)
@@ -883,27 +886,104 @@ function renderReportCreate(propsList) {
   const geo = { lat:null, lng:null };
   let ocrRunToken = 0;
   const setOcrState = (t) => { const el = $("#ocrState"); if (el) el.textContent = t; };
+
+  // Draft state: We create a report row early (for OCR) and finalize/update on Save.
+  let draftReportId = null;
+  let draftPhotoPath = null;
+  let draftPhotoSig = null;
+
+  const _normalizePlate = (s) => String(s || "")
+    .toUpperCase()
+    .replace(/[^A-Z0-9]/g, "");
+
+  const ensureDraftReport = async () => {
+    if (draftReportId) return draftReportId;
+
+    const plate0 = $("#rPlate").value.trim().replace(/\s+/g,"").toUpperCase() || null;
+    const property_id0 = $("#rProperty").value || null;
+    const notes0 = $("#rNotes").value.trim() || null;
+    const occurred_at0 = new Date().toISOString();
+
+    const { data, error } = await supabase
+      .from("reports")
+      .insert({ org_id: orgId, property_id: property_id0, plate: plate0, notes: notes0, occurred_at: occurred_at0, lat: geo.lat, lng: geo.lng })
+      .select("id")
+      .single();
+
+    if (error) throw error;
+    draftReportId = data.id;
+    return draftReportId;
+  };
+
+  const ensurePhotoUploadedForDraft = async () => {
+    const file = $("#rPhoto")?.files?.[0];
+    if (!file) throw new Error("Bitte zuerst ein Foto wählen.");
+
+    const sig = `${file.name}|${file.size}|${file.lastModified}`;
+    const reportId = await ensureDraftReport();
+
+    if (draftPhotoPath && draftPhotoSig === sig) return { reportId, path: draftPhotoPath };
+
+    // Replace previous uploaded photo if user changed the file
+    if (draftPhotoPath && draftPhotoSig !== sig) {
+      try { await supabase.storage.from("captures").remove([draftPhotoPath]); } catch {}
+      try { await supabase.from("report_photos").delete().eq("report_id", reportId).eq("storage_path", draftPhotoPath); } catch {}
+      draftPhotoPath = null;
+      draftPhotoSig = null;
+    }
+
+    const resized = await resizeImageFile(file, MAX_EDGE, JPEG_QUALITY);
+    const path = `org/${orgId}/reports/${reportId}/${Date.now()}_${safeName(file.name || "capture.jpg")}`;
+
+    const up = await supabase.storage.from("captures").upload(path, resized, { contentType: resized.type, upsert: true });
+    if (up.error) throw up.error;
+
+    const { error: e2 } = await supabase.from("report_photos").insert({
+      report_id: reportId,
+      org_id: orgId,
+      storage_path: path
+    });
+    if (e2) throw e2;
+
+    draftPhotoPath = path;
+    draftPhotoSig = sig;
+    return { reportId, path };
+  };
+
   const runOcrForSelectedPhoto = async () => {
     const file = $("#rPhoto")?.files?.[0];
     if (!file) return toast("Bitte zuerst ein Foto wählen.", "err");
 
     const token = ++ocrRunToken;
-    setOcrState("OCR: läuft …");
+    setOcrState("OCR: upload …");
 
     try {
-      const plate = await ocrPlateFromImageFile(file, (p) => {
-        if (token !== ocrRunToken) return;
-        if (typeof p === "number") setOcrState(`OCR: ${Math.round(p * 100)}%`);
-      });
+      const { reportId, path } = await ensurePhotoUploadedForDraft();
       if (token !== ocrRunToken) return;
-      if (!plate) {
+
+      setOcrState("OCR: KI läuft …");
+      const { data, error } = await supabase.functions.invoke(FN_PLATE_OCR, {
+        body: { id: reportId, image_path: path }
+      });
+      if (error) throw error;
+
+      const plateRaw = data?.plate ?? data?.nummerschild ?? "";
+      const plate = _normalizePlate(plateRaw);
+
+      if (token !== ocrRunToken) return;
+
+      if (!plate || plate.startsWith("UNBEKANNT")) {
         setOcrState("OCR: kein Treffer");
         toast("Kein Kennzeichen erkannt. Tipp: näher ran / bessere Beleuchtung.", "err");
         return;
       }
+
       $("#rPlate").value = plate;
       setOcrState("OCR: erkannt ✓");
       toast("Kennzeichen erkannt: " + plate, "ok");
+
+      // Best effort: store normalized plate
+      await supabase.from("reports").update({ plate }).eq("id", reportId);
     } catch (e) {
       if (token !== ocrRunToken) return;
       console.warn(e);
@@ -911,10 +991,26 @@ function renderReportCreate(propsList) {
       toast("OCR fehlgeschlagen: " + (e?.message || e), "err");
     }
   };
+$("#btnCancel").addEventListener("click", async () => {
+    const dirty = draftReportId || draftPhotoPath || $("#rPlate").value.trim() || $("#rNotes").value.trim();
+    if (dirty && !confirm("Bericht-Entwurf verwerfen?")) return;
 
-  $("#btnCancel").addEventListener("click", () => location.hash = "#/reports");
+    try {
+      if (draftPhotoPath) await supabase.storage.from("captures").remove([draftPhotoPath]);
+    } catch {}
 
-  $("#btnGeo").addEventListener("click", async () => {
+    try {
+      if (draftReportId) {
+        await supabase.from("report_photos").delete().eq("report_id", draftReportId);
+        await supabase.from("reports").delete().eq("id", draftReportId);
+      }
+    } catch (e) {
+      console.warn(e);
+    }
+
+    location.hash = "#/reports";
+  });
+$("#btnGeo").addEventListener("click", async () => {
     if (!navigator.geolocation) return toast("Geolocation nicht verfügbar.", "err");
     $("#geoState").textContent = "Geo: ...";
     navigator.geolocation.getCurrentPosition(
@@ -940,44 +1036,68 @@ function renderReportCreate(propsList) {
     $("#previewImg").style.display = "block";
     $("#previewText").style.display = "none";
     setOcrState("OCR: bereit");
-    // Auto-OCR: starte nach kurzer Idle-Phase (schneller Workflow).
-    if ("requestIdleCallback" in window) {
-      window.requestIdleCallback(() => { void runOcrForSelectedPhoto(); }, { timeout: 1200 });
-    } else {
-      setTimeout(() => { void runOcrForSelectedPhoto(); }, 350);
+    // Auto-OCR: nur wenn Kennzeichen noch leer ist (kosten-/traffic-schonend)
+    if (!$("#rPlate").value.trim()) {
+      if ("requestIdleCallback" in window) {
+        window.requestIdleCallback(() => { void runOcrForSelectedPhoto(); }, { timeout: 1200 });
+      } else {
+        setTimeout(() => { void runOcrForSelectedPhoto(); }, 350);
+      }
     }
-  });
+});
 
   $("#btnOcr").addEventListener("click", () => { void runOcrForSelectedPhoto(); });
 
   $("#btnSaveReport").addEventListener("click", async () => {
-    const plate = $("#rPlate").value.trim().replace(/\s+/g,"").toUpperCase() || null;
-    const property_id = $("#rProperty").value || null;
-    const notes = $("#rNotes").value.trim() || null;
-    const occurred_at = new Date().toISOString();
+    try {
+      const file = $("#rPhoto")?.files?.[0] || null;
+      let plate = $("#rPlate").value.trim().replace(/\s+/g,"").toUpperCase() || null;
+      const property_id = $("#rProperty").value || null;
+      const notes = $("#rNotes").value.trim() || null;
+      const occurred_at = new Date().toISOString();
 
-    // Insert report
-    const { data: report, error: e1 } = await supabase
-      .from("reports")
-      .insert({ org_id: orgId, property_id, plate, notes, occurred_at, lat: geo.lat, lng: geo.lng })
-      .select("*")
-      .single();
-    if (e1) return toast(e1.message, "err");
+      // Ensure we have a report id (draft) so photo + OCR can attach reliably
+      if (!draftReportId) {
+        const { data, error } = await supabase
+          .from("reports")
+          .insert({ org_id: orgId, property_id, plate, notes, occurred_at, lat: geo.lat, lng: geo.lng })
+          .select("id")
+          .single();
+        if (error) throw error;
+        draftReportId = data.id;
+      } else {
+        const { error } = await supabase
+          .from("reports")
+          .update({ property_id, plate, notes, occurred_at, lat: geo.lat, lng: geo.lng })
+          .eq("id", draftReportId);
+        if (error) throw error;
+      }
 
-    // Upload photo if present
-    const file = $("#rPhoto").files?.[0];
-    if (file) {
-      try {
-        const resized = await downscaleImage(file, 1600, 1600, 0.86);
-        const path = `org/${orgId}/reports/${report.id}/${Date.now()}_${safeName(file.name || "capture.jpg")}`;
-        const up = await supabase.storage.from("captures").upload(path, resized, { contentType: resized.type, upsert: true });
-        if (up.error) throw up.error;
+      // Upload photo (if provided)
+      if (file) {
+        await ensurePhotoUploadedForDraft();
+      }
 
-        const { error: e2 } = await supabase.from("report_photos").insert({
-          report_id: report.id,
-          org_id: orgId,
-          storage_path: path
-        });
+      // If plate is missing and a photo exists, run OCR once before finishing (best UX)
+      if ((!plate || plate.length < 4) && file) {
+        await runOcrForSelectedPhoto();
+        plate = $("#rPlate").value.trim().replace(/\s+/g,"").toUpperCase() || null;
+      }
+
+      // Final update (to ensure latest values are stored)
+      const { error: eFinal } = await supabase
+        .from("reports")
+        .update({ property_id, plate, notes, occurred_at, lat: geo.lat, lng: geo.lng })
+        .eq("id", draftReportId);
+      if (eFinal) throw eFinal;
+
+      toast("Bericht gespeichert.", "ok");
+      location.hash = "#/reports";
+    } catch (err) {
+      console.warn(err);
+      toast((err?.message || String(err)), "err");
+    }
+  });
         if (e2) throw e2;
       } catch (err) {
         console.warn(err);
@@ -992,180 +1112,7 @@ function renderReportCreate(propsList) {
   });
 }
 
-// --------- OCR (Client-side, no backend required) ----------
-// Uses Tesseract.js via CDN, loaded lazily only when OCR is triggered.
-// Goal: extract Swiss license plates (e.g., ZH123456) from a photo.
 
-const _CH_CANTONS = new Set([
-  "AG","AI","AR","BE","BL","BS","FR","GE","GL","GR","JU","LU","NE","NW","OW","SG","SH","SO","SZ","TG","TI","UR","VD","VS","ZG","ZH","FL"
-]);
-
-function _extractPlateFromText(text) {
-  const s = String(text || "")
-    .toUpperCase()
-    .replace(/[^A-Z0-9\s]/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
-
-  // Swiss-style: 2 letters + 1..6 digits
-  const candidates = [];
-  for (const m of s.matchAll(/(?:^|\s)([A-Z]{2})\s*([0-9]{1,6})(?=\s|$)/g)) {
-    const code = m[1];
-    const digits = m[2];
-    if (!_CH_CANTONS.has(code)) continue;
-    const plate = `${code}${digits}`;
-    // Prefer typical lengths (4-6 digits), but keep all
-    const score = (digits.length >= 4 ? 1 : 0.6) + (digits.length >= 5 ? 0.2 : 0);
-    candidates.push({ plate, score });
-  }
-
-  // Fallback: any A..Z + digits (useful for EU plates), keep conservative
-  if (!candidates.length) {
-    for (const m of s.matchAll(/(?:^|\s)([A-Z]{1,3})([0-9]{1,4})([A-Z]{1,3})(?=\s|$)/g)) {
-      const plate = `${m[1]}${m[2]}${m[3]}`;
-      if (plate.length < 5) continue;
-      candidates.push({ plate, score: 0.4 });
-    }
-  }
-
-  candidates.sort((a, b) => b.score - a.score);
-  return candidates[0]?.plate || null;
-}
-
-async function _fileToCanvas(file, maxEdge = 1600) {
-  const img = await fileToImage(file);
-  const ratio = Math.min(maxEdge / img.width, maxEdge / img.height, 1);
-  const w = Math.max(1, Math.round(img.width * ratio));
-  const h = Math.max(1, Math.round(img.height * ratio));
-  const c = document.createElement("canvas");
-  c.width = w; c.height = h;
-  const ctx = c.getContext("2d");
-  ctx.drawImage(img, 0, 0, w, h);
-  return c;
-}
-
-function _cropCanvas(src, x, y, w, h) {
-  const c = document.createElement("canvas");
-  c.width = Math.max(1, Math.round(w));
-  c.height = Math.max(1, Math.round(h));
-  const ctx = c.getContext("2d");
-  ctx.drawImage(src, Math.round(x), Math.round(y), Math.round(w), Math.round(h), 0, 0, c.width, c.height);
-  return c;
-}
-
-function _enhanceForOcr(canvas) {
-  const ctx = canvas.getContext("2d");
-  const img = ctx.getImageData(0, 0, canvas.width, canvas.height);
-  const d = img.data;
-  // light grayscale + contrast bump
-  const contrast = 1.25;
-  const intercept = 128 * (1 - contrast);
-  for (let i = 0; i < d.length; i += 4) {
-    const r = d[i], g = d[i + 1], b = d[i + 2];
-    let v = 0.299 * r + 0.587 * g + 0.114 * b;
-    v = contrast * v + intercept;
-    v = v < 0 ? 0 : v > 255 ? 255 : v;
-    d[i] = d[i + 1] = d[i + 2] = v;
-    // keep alpha
-  }
-  ctx.putImageData(img, 0, 0);
-  return canvas;
-}
-
-function _buildOcrCandidates(baseCanvas) {
-  const w = baseCanvas.width;
-  const h = baseCanvas.height;
-  const crops = [];
-  crops.push(baseCanvas);
-  // Bottom region (plates often in lower part)
-  crops.push(_cropCanvas(baseCanvas, w * 0.08, h * 0.55, w * 0.84, h * 0.40));
-  // Center region
-  crops.push(_cropCanvas(baseCanvas, w * 0.12, h * 0.35, w * 0.76, h * 0.45));
-  // Make them OCR-friendly
-  return crops.map((c) => _enhanceForOcr(c));
-}
-
-async function ocrPlateFromImageFile(file, onProgress) {
-  // Lazy-load Tesseract only when needed.
-  const mod = await import("https://cdn.jsdelivr.net/npm/tesseract.js@4.1.1/dist/tesseract.esm.min.js");
-  const createWorker = mod.createWorker || mod.default?.createWorker;
-  if (!createWorker) throw new Error("Tesseract konnte nicht geladen werden.");
-
-  const baseCanvas = await _fileToCanvas(file, 1700);
-  const canvases = _buildOcrCandidates(baseCanvas);
-
-  const worker = await createWorker({
-    logger: (m) => {
-      if (m?.status === "recognizing text" && typeof m.progress === "number") onProgress?.(m.progress);
-    }
-  });
-
-  try {
-    if (worker.load) await worker.load();
-    if (worker.loadLanguage) await worker.loadLanguage("eng");
-    if (worker.initialize) await worker.initialize("eng");
-    if (worker.setParameters) {
-      await worker.setParameters({
-        tessedit_char_whitelist: "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789",
-        preserve_interword_spaces: "1"
-      });
-    }
-
-    let bestPlate = null;
-    let bestConf = -1;
-
-    for (const c of canvases) {
-      const res = await worker.recognize(c);
-      const text = res?.data?.text ?? "";
-      const plate = _extractPlateFromText(text);
-      const conf = typeof res?.data?.confidence === "number" ? res.data.confidence : 0;
-      if (plate) {
-        // Prefer higher confidence (0..100)
-        if (conf > bestConf) {
-          bestConf = conf;
-          bestPlate = plate;
-        }
-        // Early-exit if confidence looks good
-        if (conf >= 70) break;
-      }
-    }
-
-    return bestPlate;
-  } finally {
-    try { await worker.terminate(); } catch {}
-  }
-}
-
-function safeName(name) {
-  return String(name).replace(/[^a-zA-Z0-9._-]+/g, "_").slice(0, 120);
-}
-
-async function downscaleImage(file, maxW, maxH, quality=0.85) {
-  // Client-side resize for faster uploads
-  const img = await fileToImage(file);
-  const ratio = Math.min(maxW / img.width, maxH / img.height, 1);
-  const w = Math.round(img.width * ratio);
-  const h = Math.round(img.height * ratio);
-
-  const canvas = document.createElement("canvas");
-  canvas.width = w;
-  canvas.height = h;
-  const ctx = canvas.getContext("2d");
-  ctx.drawImage(img, 0, 0, w, h);
-
-  const blob = await new Promise((resolve) => canvas.toBlob(resolve, "image/jpeg", quality));
-  return new File([blob], "capture.jpg", { type: "image/jpeg" });
-}
-
-function fileToImage(file) {
-  return new Promise((resolve, reject) => {
-    const url = URL.createObjectURL(file);
-    const img = new Image();
-    img.onload = () => { URL.revokeObjectURL(url); resolve(img); };
-    img.onerror = (e) => reject(e);
-    img.src = url;
-  });
-}
 
 // --------- Settings ----------
 async function renderSettings() {
