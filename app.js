@@ -1100,4 +1100,4 @@ async function renderSettings() {
 
 // Boot
 if (!location.hash) location.hash = "#/login";
-await router();
+(async () => { try { await router(); } catch (e) { console.error(e); try { toast("Fehler beim Starten: " + (e?.message ?? e), "error"); } catch {} } })();
