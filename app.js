@@ -942,73 +942,6 @@ function renderReportCreate(propsList) {
       report_id: reportId,
       org_id: orgId,
       storage_path: path
-    });
-    if (e2) throw e2;
-
-    draftPhotoPath = path;
-    draftPhotoSig = sig;
-    return { reportId, path };
-  };
-
-  const runOcrForSelectedPhoto = async () => {
-    const file = $("#rPhoto")?.files?.[0];
-    if (!file) return toast("Bitte zuerst ein Foto wählen.", "err");
-
-    const token = ++ocrRunToken;
-    setOcrState("OCR: upload …");
-
-    try {
-      const { reportId, path } = await ensurePhotoUploadedForDraft();
-      if (token !== ocrRunToken) return;
-
-      setOcrState("OCR: KI läuft …");
-      const { data, error } = await supabase.functions.invoke(FN_PLATE_OCR, {
-        body: { id: reportId, image_path: path }
-      });
-      if (error) throw error;
-
-      const plateRaw = data?.plate ?? data?.nummerschild ?? "";
-      const plate = _normalizePlate(plateRaw);
-
-      if (token !== ocrRunToken) return;
-
-      if (!plate || plate.startsWith("UNBEKANNT")) {
-        setOcrState("OCR: kein Treffer");
-        toast("Kein Kennzeichen erkannt. Tipp: näher ran / bessere Beleuchtung.", "err");
-        return;
-      }
-
-      $("#rPlate").value = plate;
-      setOcrState("OCR: erkannt ✓");
-      toast("Kennzeichen erkannt: " + plate, "ok");
-
-      // Best effort: store normalized plate
-      await supabase.from("reports").update({ plate }).eq("id", reportId);
-    } catch (e) {
-      if (token !== ocrRunToken) return;
-      console.warn(e);
-      setOcrState("OCR: Fehler");
-      toast("OCR fehlgeschlagen: " + (e?.message || e), "err");
-    }
-  };
-$("#btnCancel").addEventListener("click", async () => {
-    const dirty = draftReportId || draftPhotoPath || $("#rPlate").value.trim() || $("#rNotes").value.trim();
-    if (dirty && !confirm("Bericht-Entwurf verwerfen?")) return;
-
-    try {
-      if (draftPhotoPath) await supabase.storage.from("captures").remove([draftPhotoPath]);
-    } catch {}
-
-    try {
-      if (draftReportId) {
-        await supabase.from("report_photos").delete().eq("report_id", draftReportId);
-        await supabase.from("reports").delete().eq("id", draftReportId);
-      }
-    } catch (e) {
-      console.warn(e);
-    }
-
-    location.hash = "#/reports";
   });
 $("#btnGeo").addEventListener("click", async () => {
     if (!navigator.geolocation) return toast("Geolocation nicht verfügbar.", "err");
@@ -1097,18 +1030,6 @@ $("#btnGeo").addEventListener("click", async () => {
       console.warn(err);
       toast((err?.message || String(err)), "err");
     }
-  });
-        if (e2) throw e2;
-      } catch (err) {
-        console.warn(err);
-        toast("Bericht gespeichert, Foto-Upload fehlgeschlagen: " + (err.message || err), "err");
-        location.hash = "#/reports";
-        return;
-      }
-    }
-
-    toast("Bericht gespeichert.", "ok");
-    location.hash = "#/reports";
   });
 }
 
